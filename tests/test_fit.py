@@ -527,11 +527,12 @@ class TestHFCalculatorMatch:
             f"fit.py doesn't match HF calculator formula! " \
             f"Model: {model_id}, HF: {hf_gb:.2f}GB, fit.py: {fitpy_gb:.2f}GB ({diff_ratio*100:.2f}% diff)"
 
+    # Sliding-window models are deliberately absent here: the HF formula
+    # charges every layer a full-context cache, which is not what a serving
+    # engine allocates. They are covered by TestSlidingWindowAttention.
     @pytest.mark.parametrize("model_id", [
         "meta-llama/Llama-3.1-8B-Instruct",
         "meta-llama/Llama-3.3-70B-Instruct",
-        "google/gemma-2-9b-it",
-        "google/gemma-2-27b-it",
     ])
     def test_gated_models_match_hf_calc(self, model_id):
         """
@@ -1483,8 +1484,9 @@ class TestMixedPrecisionQuantization:
         assert breakdown["ffn_bpp"] == 0.55, "FFN/experts should be mxfp4"
 
         # Sum of components should match total weights
-        component_sum = (breakdown["embed_bytes"] + breakdown["attn_bytes"] +
-                        breakdown["router_bytes"] + breakdown["ffn_bytes"])
+        component_sum = sum(breakdown[f"{name}_bytes"] for name in
+                            ("embed", "head", "attn", "state", "router",
+                             "ffn", "vision"))
         assert abs(component_sum - weights_bytes) <= 1, \
             f"Component sum ({component_sum}) should match total weights ({weights_bytes})"
 
@@ -1589,8 +1591,9 @@ class TestMixedPrecisionQuantization:
         breakdown = result["mixed_breakdown"]
 
         # Sum of component params
-        component_params = (breakdown["embed_params"] + breakdown["attn_params"] +
-                           breakdown["router_params"] + breakdown["ffn_params"])
+        component_params = sum(breakdown[f"{name}_params"] for name in
+                               ("embed", "head", "attn", "state", "router",
+                                "ffn", "vision"))
 
         # Should equal total params (allowing small rounding difference)
         total_params = result["params"]
@@ -1632,6 +1635,388 @@ class TestMixedPrecisionQuantization:
 
         # Should quantize FFN/experts to int4
         assert breakdown["ffn_bpp"] == 0.55, "FFN/experts should be quantized to int4"
+
+
+def _dense_cfg(**overrides):
+    """A minimal full-attention decoder config, for layout tests."""
+    cfg = {
+        "architectures": ["LlamaForCausalLM"],
+        "model_type": "llama",
+        "torch_dtype": "bfloat16",
+        "hidden_size": 4096,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "intermediate_size": 14336,
+        "vocab_size": 128256,
+        "tie_word_embeddings": False,
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+class TestSlidingWindowAttention:
+    """Windowed layers hold a bounded cache, and only when the config says so."""
+
+    def test_layer_types_split_full_and_sliding(self):
+        cfg = _dense_cfg(
+            model_type="gpt_oss",
+            num_hidden_layers=4,
+            sliding_window=128,
+            layer_types=["sliding_attention", "full_attention"] * 2,
+        )
+        d = parse_dims(cfg)
+        assert d.num_sliding_attn_layers == 2
+        assert d.num_full_attn_layers == 2
+        assert d.sliding_window == 128
+
+    def test_window_charge_is_bounded_by_the_window(self):
+        cfg = _dense_cfg(model_type="mistral", sliding_window=4096)
+        d = parse_dims(cfg)
+        assert d.num_sliding_attn_layers == d.num_layers
+
+        # Doubling the context past the window must not double the cache.
+        short = kv_bytes(d, 32768, 1, "bf16", "vllm", 4096)
+        long = kv_bytes(d, 65536, 1, "bf16", "vllm", 4096)
+        assert short == long, "cache should saturate once the window is full"
+
+    def test_vllm_charges_more_than_the_bare_window(self):
+        """vLLM cannot free a block until every token in it has left the window."""
+        cfg = _dense_cfg(model_type="mistral", sliding_window=4096)
+        d = parse_dims(cfg)
+        assert fit.sliding_ctx(d, 65536, "torch", 4096) == 4096
+        assert fit.sliding_ctx(d, 65536, "vllm", 4096) == 4095 + 4096
+
+    def test_sglang_sizes_the_pool_as_a_fraction_of_the_full_pool(self):
+        cfg = _dense_cfg(model_type="mistral", sliding_window=4096)
+        d = parse_dims(cfg)
+        assert fit.sliding_ctx(d, 32768, "sglang", 4096) == int(0.8 * 32768)
+
+    def test_max_num_batched_tokens_follows_the_vllm_tier_table(self):
+        assert fit.default_max_num_batched_tokens(24.0) == 2048
+        assert fit.default_max_num_batched_tokens(80.0) == 8192
+        assert fit.max_in_flight_tokens(24.0) == 4096
+
+    def test_unattributable_window_is_charged_as_full_attention(self):
+        """DeepSeek-V4 carries sliding_window: 128 but caches every token.
+
+        The key belongs to its sparse-attention indexer, not to a windowed
+        layer. Honouring it would under-estimate the cache eightfold, and an
+        under-estimate is what reports FITS for a launch that then dies.
+        """
+        cfg = _dense_cfg(model_type="deepseek_v4", sliding_window=128)
+        d = parse_dims(cfg)
+        assert d.num_sliding_attn_layers == 0
+        assert d.num_full_attn_layers == d.num_layers
+        assert d.sliding_window == 0
+
+    def test_use_sliding_window_false_is_respected(self):
+        cfg = _dense_cfg(model_type="qwen2", sliding_window=131072,
+                         use_sliding_window=False)
+        assert parse_dims(cfg).num_sliding_attn_layers == 0
+
+    @pytest.mark.parametrize("model_id", [
+        "google/gemma-2-9b-it",
+        "google/gemma-2-27b-it",
+    ])
+    def test_gemma2_interleaves_global_and_windowed_layers(self, model_id):
+        """Gemma-2 alternates 4096-token and global layers, at 1:1."""
+        cfg = fetch_config(model_id)
+        d = parse_dims(cfg)
+        assert d.sliding_window == 4096
+        assert d.num_full_attn_layers == d.num_layers // 2
+        assert d.num_sliding_attn_layers == d.num_layers - d.num_layers // 2
+
+        # At 32k context the windowed half holds 4095 + 4096 tokens, so the
+        # cache lands at 62.5% of what a full-attention model would need.
+        naive = 2 * d.num_layers * d.num_kv_heads * d.head_dim * 32768 * 8 * 2
+        result = estimate(cfg, "bf16", "bf16", 32768, 8, 1, "vllm", 32.0)
+        assert 0.60 < result["kv"] / naive < 0.65
+
+    def test_max_context_accounts_for_the_window(self):
+        """The ceiling is found by bisection, not by dividing a per-token cost."""
+        cfg = _dense_cfg(model_type="mistral", sliding_window=4096,
+                         num_hidden_layers=8)
+        windowed = estimate(cfg, "bf16", "bf16", 8192, 1, 1, "vllm", 32.0)
+        full = estimate(_dense_cfg(num_hidden_layers=8), "bf16", "bf16",
+                        8192, 1, 1, "vllm", 32.0)
+        assert windowed["max_context"] > full["max_context"]
+
+
+class TestHybridStateSpace:
+    """Recurrent layers hold a state pool instead of a KV cache."""
+
+    GDN = dict(
+        model_type="qwen3_next",
+        num_hidden_layers=4,
+        layer_types=["linear_attention"] * 3 + ["full_attention"],
+        linear_num_key_heads=16,
+        linear_num_value_heads=32,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+    )
+    MAMBA2 = dict(
+        model_type="nemotron_h",
+        num_hidden_layers=4,
+        hybrid_override_pattern="M-M*",
+        mamba_d_state=128,
+        mamba_d_conv=4,
+        mamba_num_heads=128,
+        mamba_head_dim=64,
+        mamba_n_groups=8,
+    )
+
+    def test_gated_delta_net_geometry(self):
+        d = parse_dims(_dense_cfg(**self.GDN))
+        assert d.num_recurrent_layers == 3
+        assert d.num_full_attn_layers == 1
+        assert d.num_state_heads == 32
+        assert d.state_head_dim_k == 128
+        assert d.state_head_dim_v == 128
+        # conv spans q and k (2 x 16 x 128) plus v (32 x 128).
+        assert d.conv_dim == 2 * 16 * 128 + 32 * 128
+
+    def test_mamba2_geometry_from_the_head_split(self):
+        """Nemotron-H states the head split but never the inner width."""
+        d = parse_dims(_dense_cfg(**self.MAMBA2))
+        assert d.num_recurrent_layers == 2
+        assert d.num_full_attn_layers == 1
+        assert d.state_inner == 128 * 64
+        assert d.conv_dim == 128 * 64 + 2 * 8 * 128
+
+    def test_conv_state_holds_one_fewer_column_than_the_kernel(self):
+        """The current token is computed, not cached."""
+        cfg = _dense_cfg(**self.GDN)
+        d = parse_dims(cfg)
+        conv = d.conv_dim * (d.conv_kernel - 1) * 2
+        ssm = d.num_state_heads * d.state_head_dim_k * d.state_head_dim_v * 2
+        assert fit.state_page_bytes(d, 1) == (conv + ssm) * d.num_recurrent_layers
+
+    def test_state_is_independent_of_context(self):
+        cfg = _dense_cfg(**self.GDN)
+        short = estimate(cfg, "bf16", "bf16", 1024, 4, 1, "vllm", 32.0)
+        long = estimate(cfg, "bf16", "bf16", 131072, 4, 1, "vllm", 32.0)
+        assert short["state"] == long["state"] > 0
+        assert long["kv"] > short["kv"]
+
+    def test_state_scales_with_concurrency_not_a_fixed_slot_count(self):
+        cfg = _dense_cfg(**self.GDN)
+        one = estimate(cfg, "bf16", "bf16", 4096, 1, 1, "vllm", 32.0)
+        eight = estimate(cfg, "bf16", "bf16", 4096, 8, 1, "vllm", 32.0)
+        assert eight["state"] == 8 * one["state"]
+
+    def test_recurrent_layers_hold_no_kv_cache(self):
+        cfg = _dense_cfg(**self.GDN)
+        d = parse_dims(cfg)
+        per_layer = 2 * d.num_kv_heads * d.head_dim * 2 * 4096
+        assert kv_bytes(d, 4096, 1, "bf16") == per_layer
+
+    def test_sglang_keeps_the_ssm_state_in_fp32(self):
+        d = parse_dims(_dense_cfg(**self.GDN))
+        assert (fit.state_page_bytes(d, 1, "sglang")
+                > fit.state_page_bytes(d, 1, "vllm"))
+
+    def test_state_shards_across_tp(self):
+        d = parse_dims(_dense_cfg(**self.GDN))
+        assert fit.state_page_bytes(d, 2) < fit.state_page_bytes(d, 1)
+        assert fit.state_page_bytes(d, 2) == fit.state_page_bytes(d, 1) // 2
+
+    def test_indivisible_head_count_costs_more_not_less(self):
+        """vLLM pads head shards rather than splitting a head across ranks."""
+        cfg = _dense_cfg(**{**self.GDN, "linear_num_value_heads": 3,
+                            "linear_num_key_heads": 3})
+        d = parse_dims(cfg)
+        exact = fit.state_page_bytes(d, 1) / 2
+        assert fit.state_page_bytes(d, 2) > exact
+
+    def test_parallel_hybrid_is_charged_both_state_and_full_kv(self):
+        """Falcon-H1 runs attention and an SSM in the same layer."""
+        cfg = _dense_cfg(model_type="falcon_h1", num_hidden_layers=8,
+                         mamba_d_state=256, mamba_d_conv=4,
+                         mamba_d_ssm=4096, mamba_n_heads=64, mamba_d_head=64)
+        d = parse_dims(cfg)
+        assert d.num_full_attn_layers == 8
+        assert d.num_recurrent_layers == 8
+        result = estimate(cfg, "bf16", "bf16", 4096, 2, 1, "vllm", 32.0)
+        assert result["kv"] > 0 and result["state"] > 0
+
+    def test_pure_ssm_has_no_kv_cache(self):
+        cfg = _dense_cfg(model_type="mamba", layer_types=["mamba"],
+                         state_size=16, conv_kernel=4, expand=2)
+        result = estimate(cfg, "bf16", "bf16", 8192, 4, 1, "vllm", 32.0)
+        assert result["kv"] == 0
+        assert result["state"] > 0
+
+    def test_recurrent_layers_without_geometry_refuse(self):
+        """Guessing a state pool is worse than declining to answer."""
+        cfg = _dense_cfg(model_type="mystery_hybrid", num_hidden_layers=4,
+                         layer_types=["mamba", "mamba", "mamba",
+                                      "full_attention"])
+        with pytest.raises(SystemExit) as exc:
+            parse_dims(cfg)
+        assert "mamba_d_state" in str(exc.value)
+
+    def test_recurrent_weights_are_not_charged_as_attention(self):
+        """An SSM layer has no Q/K/V/O projections to count."""
+        hybrid = count_params(parse_dims(_dense_cfg(**self.GDN)))
+        dense = count_params(parse_dims(_dense_cfg(num_hidden_layers=4)))
+        assert hybrid != dense
+
+    def test_layout_tally_is_rescaled_when_it_misses_num_layers(self):
+        """A short pattern keeps its ratio instead of being discarded."""
+        cfg = _dense_cfg(**{**self.MAMBA2, "num_hidden_layers": 8})
+        d = parse_dims(cfg)
+        assert d.num_recurrent_layers == 4
+        assert d.num_full_attn_layers == 2
+
+
+class TestQuantDetection:
+    """Most checkpoints declare a bit width, not a format name."""
+
+    @pytest.mark.parametrize("qcfg,expected", [
+        ({"quant_method": "fp8"}, "fp8"),
+        ({"quant_method": "mxfp4"}, "mxfp4"),
+        ({"quant_method": "gptq", "bits": 4}, "int4"),
+        ({"quant_method": "awq", "w_bit": 4}, "int4"),
+        ({"quant_method": "bitsandbytes", "load_in_4bit": True}, "int4"),
+        ({"quant_method": "bitsandbytes", "load_in_8bit": True}, "int8"),
+        ({"quant_method": "compressed-tensors", "config_groups": {
+            "group_0": {"weights": {"num_bits": 4, "type": "int"}}}}, "int4"),
+        ({"quant_method": "compressed-tensors", "config_groups": {
+            "group_0": {"weights": {"num_bits": 8, "type": "float"}}}}, "fp8"),
+        ({"quant_method": "modelopt", "quant_algo": "FP8"}, "fp8"),
+        ({}, None),
+    ])
+    def test_detect_quant(self, qcfg, expected):
+        cfg = _dense_cfg(quantization_config=qcfg) if qcfg else _dense_cfg()
+        assert fit.detect_quant(cfg) == expected
+
+    def test_mixed_widths_charge_the_widest(self):
+        cfg = _dense_cfg(quantization_config={
+            "quant_method": "compressed-tensors",
+            "config_groups": {
+                "group_0": {"weights": {"num_bits": 4, "type": "int"}},
+                "group_1": {"weights": {"num_bits": 8, "type": "int"}},
+            },
+        })
+        assert fit.detect_quant(cfg) == "int8"
+
+
+class TestQuantizationExclusions:
+    """Exclusion lists decide which tensors are actually stored narrow."""
+
+    @pytest.mark.parametrize("key", [
+        "modules_to_not_convert", "ignore", "ignored_layers",
+        "exclude_modules", "exclude", "llm_int8_skip_modules",
+    ])
+    def test_every_exclusion_key_is_read(self, key):
+        cfg = _dense_cfg(quantization_config={
+            "quant_method": "compressed-tensors", "bits": 4,
+            key: ["model.layers.0.self_attn.q_proj"],
+        })
+        result = estimate(cfg, "int4", "fp8", 4096, 1, 1, "vllm", 32.0)
+        assert result["mixed_breakdown"]["attn_bpp"] == 2.0
+
+    def test_regex_exclusions_match(self):
+        """compressed-tensors writes 're:' patterns, applied with re.match."""
+        cfg = _dense_cfg(quantization_config={
+            "quant_method": "compressed-tensors", "bits": 4,
+            "ignore": ["re:.*self_attn.*", "lm_head"],
+        })
+        result = estimate(cfg, "int4", "fp8", 4096, 1, 1, "vllm", 32.0)
+        assert result["mixed_breakdown"]["attn_bpp"] == 2.0
+
+    def test_invalid_regex_does_not_crash(self):
+        cfg = _dense_cfg(quantization_config={
+            "quant_method": "compressed-tensors", "bits": 4,
+            "ignore": ["re:[unclosed"],
+        })
+        result = estimate(cfg, "int4", "fp8", 4096, 1, 1, "vllm", 32.0)
+        assert result["weights"] > 0
+
+    def test_glob_exclusions_match_children(self):
+        cfg = _dense_cfg(quantization_config={
+            "quant_method": "gptq", "bits": 4,
+            "modules_to_not_convert": ["model.layers.*.self_attn"],
+        })
+        result = estimate(cfg, "int4", "fp8", 4096, 1, 1, "vllm", 32.0)
+        assert result["mixed_breakdown"]["attn_bpp"] == 2.0
+
+    def test_embeddings_are_always_full_precision(self):
+        """Every scheme here targets Linear modules; nn.Embedding is not one."""
+        cfg = _dense_cfg(quantization_config={"quant_method": "gptq", "bits": 4})
+        result = estimate(cfg, "int4", "fp8", 4096, 1, 1, "vllm", 32.0)
+        assert result["mixed_breakdown"]["embed_bpp"] == 2.0
+
+    def test_output_head_is_full_precision_unless_asked_for(self):
+        plain = _dense_cfg(quantization_config={"quant_method": "gptq", "bits": 4})
+        asked = _dense_cfg(quantization_config={"quant_method": "gptq",
+                                                "bits": 4, "lm_head": True})
+        assert estimate(plain, "int4", "fp8", 4096, 1, 1, "vllm", 32.0
+                        )["mixed_breakdown"]["head_bpp"] == 2.0
+        assert estimate(asked, "int4", "fp8", 4096, 1, 1, "vllm", 32.0
+                        )["mixed_breakdown"]["head_bpp"] == 0.55
+
+    def test_config_group_targeting_the_head_quantizes_it(self):
+        cfg = _dense_cfg(quantization_config={
+            "quant_method": "compressed-tensors",
+            "config_groups": {"group_0": {
+                "targets": ["Linear", "re:lm_head"],
+                "weights": {"num_bits": 4, "type": "int"},
+            }},
+        })
+        result = estimate(cfg, "int4", "fp8", 4096, 1, 1, "vllm", 32.0)
+        assert result["mixed_breakdown"]["head_bpp"] == 0.55
+
+    def test_excluding_the_head_wins_over_targeting_it(self):
+        cfg = _dense_cfg(quantization_config={
+            "quant_method": "compressed-tensors", "lm_head": True,
+            "bits": 4, "ignore": ["lm_head"],
+        })
+        result = estimate(cfg, "int4", "fp8", 4096, 1, 1, "vllm", 32.0)
+        assert result["mixed_breakdown"]["head_bpp"] == 2.0
+
+    def test_excluding_state_projections_on_a_hybrid(self):
+        cfg = _dense_cfg(
+            model_type="qwen3_next", num_hidden_layers=4,
+            layer_types=["linear_attention"] * 3 + ["full_attention"],
+            linear_num_key_heads=16, linear_num_value_heads=32,
+            linear_key_head_dim=128, linear_value_head_dim=128,
+            linear_conv_kernel_dim=4,
+            quantization_config={
+                "quant_method": "compressed-tensors", "bits": 4,
+                "ignore": ["re:.*linear_attn.*"],
+            },
+        )
+        result = estimate(cfg, "int4", "fp8", 4096, 1, 1, "vllm", 32.0)
+        assert result["mixed_breakdown"]["state_bpp"] == 2.0
+
+
+class TestVisionTowerSharding:
+    """Both engines tensor-parallel the vision tower by default."""
+
+    VLM = dict(
+        model_type="qwen2_5_vl",
+        vision_config={"hidden_size": 1280, "depth": 32,
+                       "intermediate_size": 3420, "num_heads": 16,
+                       "patch_size": 14, "num_channels": 3},
+    )
+
+    def test_vision_tower_is_divided_by_tp(self):
+        cfg = _dense_cfg(**self.VLM)
+        one = estimate(cfg, "bf16", "bf16", 4096, 1, 1, "vllm", 32.0)
+        two = estimate(cfg, "bf16", "bf16", 4096, 1, 2, "vllm", 32.0)
+        assert abs(two["weights"] * 2 - one["weights"]) <= 2
+
+    def test_indivisible_vision_heads_are_replicated(self):
+        cfg = _dense_cfg(**{**self.VLM,
+                            "vision_config": {**self.VLM["vision_config"],
+                                              "num_heads": 3}})
+        two = estimate(cfg, "bf16", "bf16", 4096, 1, 2, "vllm", 32.0)
+        assert two["weights"] * 2 > estimate(
+            cfg, "bf16", "bf16", 4096, 1, 1, "vllm", 32.0)["weights"]
 
 
 if __name__ == "__main__":

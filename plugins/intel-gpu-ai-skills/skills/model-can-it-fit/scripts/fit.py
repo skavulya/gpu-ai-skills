@@ -4,18 +4,22 @@
 """Estimate VRAM needed to serve a Hugging Face model on an Intel GPU.
 
 Pulls config.json from the Hub, computes weights + KV cache +
-activations + framework overhead, prints a verdict.
+recurrent state + activations + framework overhead, prints a verdict.
 
-Decoder-only LLM only. VLM/diffusion fall through to a weights-only
+Handles decoder-only LLMs, mixture-of-experts, sliding-window attention,
+and hybrid state-space (Mamba / Mamba2 / gated-delta-net) models. VLM
+towers are counted as weights; diffusion falls through to a weights-only
 floor with a clear caveat.
 """
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
+import re
 import sys
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 GB = 1024 ** 3
@@ -39,12 +43,34 @@ BYTES_PER_KV = {
     "bf16": 2.0, "fp16": 2.0, "fp8": 1.0, "int8": 1.0,
 }
 
+# Element size of a recurrent (conv / SSM) state tensor, keyed by the dtype
+# name a config or a runtime flag can use. Recurrent state is never
+# quantized by either engine, so this table is separate from BYTES_PER_KV.
+BYTES_PER_STATE_DTYPE = {
+    "bfloat16": 2.0, "bf16": 2.0,
+    "float16": 2.0, "fp16": 2.0, "half": 2.0,
+    "float32": 4.0, "fp32": 4.0, "float": 4.0,
+    "float8_e4m3fn": 1.0, "float8_e5m2": 1.0, "fp8": 1.0,
+}
+
 # Empirical floors on Arc Pro B70.
 FRAMEWORK_OVERHEAD_GB = {
     "vllm":   2.0,
     "sglang": 1.5,
     "torch":  0.8,
 }
+
+# vLLM's default --max-num-batched-tokens for an OpenAI API server, from the
+# device-memory tier table in vllm/engine/arg_utils.py. Small cards get the
+# 2048 tier; only >=70 GiB datacentre parts get 8192.
+VLLM_LARGE_DEVICE_GIB = 70
+VLLM_MAX_NUM_BATCHED_TOKENS_LARGE = 8192
+VLLM_MAX_NUM_BATCHED_TOKENS_SMALL = 2048
+
+# SGLang does not size its sliding-window pool to the window. It provisions
+# the window pool as a fraction of the full-attention pool so the radix
+# prefix cache still has something to reuse (--swa-full-tokens-ratio).
+SGLANG_SWA_FULL_TOKENS_RATIO = 0.8
 
 TABLE_MODELS = [
     "Qwen/Qwen2.5-1.5B-Instruct",
@@ -162,6 +188,41 @@ class ModelDims:
     dense_intermediate: int = 0
     is_vlm: bool = False
     vision_params: int = 0
+    vision_num_heads: int = 0
+
+    # --- Layer composition -------------------------------------------------
+    # For a plain dense model every layer is full attention and every layer
+    # carries a feed-forward block, so these default to num_layers in
+    # parse_dims. Hybrids split the total: an SSM layer holds recurrent state
+    # instead of a KV cache, a sliding-window layer holds a bounded KV cache,
+    # and some families (Nemotron-H, Bamba) interleave attention-free and
+    # feed-forward-free layers.
+    num_full_attn_layers: int = 0
+    num_sliding_attn_layers: int = 0
+    num_recurrent_layers: int = 0
+    num_ffn_layers: int = 0
+    sliding_window: int = 0
+
+    # --- Recurrent state geometry -----------------------------------------
+    # Normalized across Mamba, Mamba2 and gated-delta-net. The per-layer SSM
+    # state is (num_state_heads, state_head_dim_k, state_head_dim_v) and the
+    # per-layer conv state is (conv_dim, conv_kernel - 1).
+    num_state_heads: int = 0
+    state_head_dim_k: int = 0
+    state_head_dim_v: int = 0
+    conv_dim: int = 0
+    conv_kernel: int = 0
+    state_size: int = 0
+    state_groups: int = 1
+    state_inner: int = 0
+    conv_dtype: str = "bfloat16"
+    ssm_dtype: str = "bfloat16"
+    # Falcon-H1 and Zamba2 run attention and an SSM in the same layer, so
+    # those layers are charged a full KV cache *and* a recurrent state.
+    attn_on_recurrent_layers: bool = False
+    # Which config keys the state geometry was actually read from, for the
+    # refusal message and for tests.
+    state_source: list[str] = field(default_factory=list)
 
 
 def _vlm_signal(cfg: dict) -> bool:
@@ -190,6 +251,299 @@ def _vision_param_count(vc: dict) -> int:
     in_channels = vc.get("num_channels", 3)
     embed = patch * patch * in_channels * h
     return embed + layers * per_layer
+
+
+# Names a config's `layer_types` list can use. Anything unrecognized is
+# treated as full attention, which is the conservative direction: a full KV
+# cache is the most expensive thing a layer can hold.
+_RECURRENT_LAYER_TYPES = {
+    "mamba", "mamba2", "ssm", "recurrent", "conv",
+    "linear_attention", "linear_attn", "gated_delta_net",
+}
+_SLIDING_LAYER_TYPES = {
+    "sliding_attention", "sliding_window_attention", "local_attention",
+    "local_sliding_attention", "chunked_attention", "chunked_local_attention",
+}
+_FULL_LAYER_TYPES = {"full_attention", "attention", "global_attention", "full"}
+_FFN_ONLY_LAYER_TYPES = {"mlp", "moe", "feed_forward", "ffn"}
+
+# Single characters used by the `hybrid_override_pattern` string
+# (Nemotron-H, Bamba): M = Mamba layer, * = attention layer, - = MLP layer.
+_PATTERN_CHARS = {"m": "recurrent", "*": "full", "-": "ffn", "_": "ffn"}
+
+# Families that run attention and an SSM inside the *same* layer rather than
+# alternating them, so every layer is charged both a KV cache and a state.
+_PARALLEL_HYBRID_FAMILIES = {"falcon_h1", "zamba", "zamba2"}
+
+# A bare `sliding_window` key does not mean the model uses a sliding window.
+# DeepSeek-V4-Flash carries `sliding_window: 128` for its sparse attention
+# indexer while every layer still holds a full KV cache -- honouring that key
+# blindly under-estimates its cache by 8x, and under-estimating is what
+# produces a FITS verdict for a launch that dies at engine init. So a window
+# is only applied when the config says which layers use it, or when the
+# family is known to apply it everywhere.
+_GLOBAL_SWA_FAMILIES = {
+    "mistral", "mistral3", "ministral", "mixtral",
+    "qwen2", "qwen2_moe", "qwen2_vl", "qwen3", "qwen3_moe",
+    "phi3", "phi3small", "phimoe",
+    "starcoder2",
+}
+
+# Families whose sliding/global interleave lives in the modeling code rather
+# than in any config key, mapped to the period between global layers.
+_INTERLEAVED_SWA_PERIOD = {"gemma2": 2, "cohere2": 4}
+
+
+def _normalize_dtype(name: object, default: str = "bfloat16") -> str:
+    """Map a config/flag dtype name onto a BYTES_PER_STATE_DTYPE key."""
+    text = str(name or "").lower().strip()
+    if text in ("", "auto", "none"):
+        return default
+    text = text.replace("torch.", "")
+    return text if text in BYTES_PER_STATE_DTYPE else default
+
+
+def _lookup(sources: list[dict], keys: tuple[str, ...]) -> tuple[object, str]:
+    """First truthy value among `keys` across `sources`, with the key used."""
+    for src in sources:
+        for key in keys:
+            value = src.get(key)
+            if value not in (None, 0, "", [], {}):
+                return value, key
+    return None, ""
+
+
+def _scale_counts(counts: dict, listed: int, num_layers: int) -> dict:
+    """Rescale a per-layer tally that does not cover exactly num_layers.
+
+    A layout list is occasionally shorter or longer than num_hidden_layers --
+    a repeating block, or a config key this script has matched to the wrong
+    family. The ratio between layer kinds is the load-bearing part, so it is
+    preserved and applied to the real layer count instead of the tally being
+    thrown away (which would silently charge every layer a full KV cache).
+    """
+    if listed == num_layers or listed <= 0:
+        return counts
+    scale = num_layers / listed
+    return {key: int(round(value * scale)) for key, value in counts.items()}
+
+
+def _layer_type_counts(types: list) -> dict:
+    """Tally an explicit per-layer list into layer kinds."""
+    counts = {"full": 0, "sliding": 0, "recurrent": 0, "ffn": 0}
+    for entry in types:
+        name = str(entry).lower()
+        if name in _RECURRENT_LAYER_TYPES:
+            counts["recurrent"] += 1
+        elif name in _SLIDING_LAYER_TYPES:
+            counts["sliding"] += 1
+        elif name in _FFN_ONLY_LAYER_TYPES:
+            counts["ffn"] += 1
+        else:
+            counts["full"] += 1
+    return counts
+
+
+def _sliding_window(cfg: dict, text_cfg: dict) -> int:
+    """Attention window in tokens, or 0 if the model is full-attention only.
+
+    A window equal to or wider than the trained context is not a window --
+    several configs carry `sliding_window` alongside
+    `use_sliding_window: false`, and Llama-4 spells its window
+    `attention_chunk_size`.
+    """
+    sources = [text_cfg, cfg]
+    for src in sources:
+        if src.get("use_sliding_window") is False:
+            return 0
+    window, _ = _lookup(sources, ("sliding_window", "attention_chunk_size",
+                                  "window_size", "attention_window_size"))
+    if isinstance(window, (list, tuple)):
+        # Some configs give a (left, right) pair; the left half is the span
+        # of past tokens a query can see, which is what the cache must hold.
+        window = window[0] if window else 0
+    try:
+        return max(int(window or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _classify_layers(cfg: dict, text_cfg: dict, family: str,
+                     num_layers: int, window: int) -> dict:
+    """Split num_layers into full-attention / sliding / recurrent / FFN counts.
+
+    Reads whichever of the mutually exclusive layout keys a family uses:
+    `layer_types` (Gemma-3, Qwen3-Next, gpt-oss, Llama-4),
+    `hybrid_override_pattern` (Nemotron-H, Bamba), `attn_layer_indices`, or a
+    periodic interleave (`attn_layer_period`, `full_attention_interval`,
+    `sliding_window_pattern`).
+    """
+    sources = [text_cfg, cfg]
+    out = {"full": 0, "sliding": 0, "recurrent": 0, "ffn": num_layers,
+           "attn_on_recurrent": False, "layout_source": ""}
+
+    layer_types, key = _lookup(sources, ("layer_types", "layer_type_list"))
+    if isinstance(layer_types, (list, tuple)) and layer_types:
+        counts = _scale_counts(_layer_type_counts(list(layer_types)),
+                               len(layer_types), num_layers)
+        out.update(counts, layout_source=key)
+        if not counts["ffn"]:
+            out["ffn"] = num_layers
+        return out
+
+    pattern, key = _lookup(sources, ("hybrid_override_pattern",
+                                     "layers_block_type"))
+    if isinstance(pattern, (list, tuple)) and pattern:
+        counts = _scale_counts(_layer_type_counts(list(pattern)),
+                               len(pattern), num_layers)
+        out.update(counts, layout_source=key)
+        if not counts["ffn"]:
+            out["ffn"] = num_layers
+        return out
+    if isinstance(pattern, str) and pattern:
+        counts = {"full": 0, "sliding": 0, "recurrent": 0, "ffn": 0}
+        for char in pattern:
+            counts[_PATTERN_CHARS.get(char.lower(), "full")] += 1
+        if window and counts["full"]:
+            counts["sliding"], counts["full"] = counts["full"], 0
+        counts = _scale_counts(counts, len(pattern), num_layers)
+        out.update(counts, layout_source=key)
+        if not counts["ffn"]:
+            out["ffn"] = num_layers
+        return out
+
+    if family in _PARALLEL_HYBRID_FAMILIES:
+        # Attention and SSM sit side by side in every layer.
+        out.update(full=num_layers, recurrent=num_layers,
+                   attn_on_recurrent=True, layout_source="model_type")
+        return out
+
+    indices, key = _lookup(sources, ("attn_layer_indices",))
+    if isinstance(indices, (list, tuple)):
+        attn = len({int(i) for i in indices if 0 <= int(i) < num_layers})
+        out.update(full=attn, recurrent=num_layers - attn, layout_source=key)
+        return out
+
+    period, key = _lookup(sources, ("attn_layer_period",))
+    if period:
+        attn = num_layers // int(period)
+        out.update(full=attn, recurrent=num_layers - attn, layout_source=key)
+        return out
+
+    interval, key = _lookup(sources, ("full_attention_interval",))
+    if interval:
+        full = num_layers // int(interval)
+        out.update(full=full, recurrent=num_layers - full, layout_source=key)
+        return out
+
+    stride, key = _lookup(sources, ("sliding_window_pattern",
+                                    "global_attn_every_n_layers"))
+    if stride and window:
+        # Gemma-3, Cohere2: every `stride`-th layer is global, rest windowed.
+        full = max(num_layers // int(stride), 1)
+        out.update(full=full, sliding=num_layers - full, layout_source=key)
+        return out
+
+    if window and family in _INTERLEAVED_SWA_PERIOD:
+        period = _INTERLEAVED_SWA_PERIOD[family]
+        full = max(num_layers // period, 1)
+        out.update(full=full, sliding=num_layers - full,
+                   layout_source="model_type")
+        return out
+
+    if window and family in _GLOBAL_SWA_FAMILIES:
+        out.update(sliding=num_layers, layout_source="sliding_window")
+        return out
+
+    # Window present but unattributable: charge full attention everywhere.
+    out.update(full=num_layers)
+    return out
+
+
+def _state_geometry(cfg: dict, text_cfg: dict, hidden: int) -> dict | None:
+    """Normalize a family's recurrent-state keys into one shape.
+
+    The per-layer SSM state is (num_state_heads, state_head_dim_k,
+    state_head_dim_v) and the per-layer conv state is (conv_dim,
+    conv_kernel - 1). Mamba1 collapses to a single head whose value
+    dimension is the whole inner width. Returns None when no geometry key
+    resolves, so the caller can refuse rather than guess.
+    """
+    sources = [text_cfg, cfg]
+    seen: list[str] = []
+
+    def take(keys: tuple[str, ...]):
+        value, key = _lookup(sources, keys)
+        if key:
+            seen.append(key)
+        return value
+
+    # Gated delta net (Qwen3-Next, Kimi-Linear): key and value heads are
+    # sized independently, and the conv state spans q, k and v.
+    num_v_heads = take(("linear_num_value_heads", "num_v_heads"))
+    if num_v_heads:
+        num_k_heads = take(("linear_num_key_heads", "num_k_heads")) or num_v_heads
+        dim_k = take(("linear_key_head_dim", "head_k_dim")) or 0
+        dim_v = take(("linear_value_head_dim", "head_v_dim")) or dim_k
+        conv_kernel = take(("linear_conv_kernel_dim", "conv_kernel_size")) or 4
+        if not (dim_k and dim_v):
+            return None
+        return {
+            "num_state_heads": int(num_v_heads),
+            "state_head_dim_k": int(dim_k),
+            "state_head_dim_v": int(dim_v),
+            "conv_dim": int(2 * dim_k * num_k_heads + dim_v * num_v_heads),
+            "conv_kernel": int(conv_kernel),
+            "state_size": int(dim_k),
+            "state_groups": int(num_k_heads),
+            "state_inner": int(dim_v * num_v_heads),
+            "state_source": seen,
+        }
+
+    # Mamba / Mamba2 (Nemotron-H, Bamba, Falcon-H1, Codestral-Mamba, Jamba).
+    d_state = take(("mamba_d_state", "state_size", "ssm_state_size", "d_state"))
+    conv_kernel = take(("mamba_d_conv", "conv_kernel", "d_conv"))
+    if not (d_state and conv_kernel):
+        return None
+
+    n_heads = take(("mamba_n_heads", "mamba_num_heads", "n_mamba_heads"))
+    head_dim = take(("mamba_d_head", "mamba_head_dim"))
+
+    # Inner width, in descending order of how directly a family states it.
+    # Falcon-H1 gives mamba_d_ssm outright; most Mamba2 configs give an
+    # expansion factor; Nemotron-H gives only the head split.
+    inner = take(("mamba_d_ssm", "mamba_expand_inner_size"))
+    if not inner:
+        expand = take(("mamba_expand", "expand"))
+        if expand:
+            inner = int(expand) * hidden
+    if not inner:
+        inner = take(("mamba_intermediate_size", "mamba_d_inner", "d_inner"))
+    if not inner and n_heads and head_dim:
+        inner = int(n_heads) * int(head_dim)
+    if not inner:
+        return None
+
+    if n_heads and not head_dim:
+        head_dim = int(inner) // int(n_heads)
+    elif head_dim and not n_heads:
+        n_heads = int(inner) // int(head_dim)
+    if not (n_heads and head_dim):
+        # Mamba1: one (d_inner, d_state) state per layer, no head split.
+        n_heads, head_dim = 1, int(inner)
+
+    groups = take(("mamba_n_groups", "n_groups", "mamba_ngroups")) or 1
+    return {
+        "num_state_heads": int(n_heads),
+        "state_head_dim_k": int(d_state),
+        "state_head_dim_v": int(head_dim),
+        "conv_dim": int(inner) + 2 * int(groups) * int(d_state),
+        "conv_kernel": int(conv_kernel),
+        "state_size": int(d_state),
+        "state_groups": int(groups),
+        "state_inner": int(inner),
+        "state_source": seen,
+    }
 
 
 def parse_dims(cfg: dict) -> ModelDims:
@@ -230,8 +584,15 @@ def parse_dims(cfg: dict) -> ModelDims:
                              cfg.get("tied_embeddings", False))))
 
     vision_params = 0
+    vision_num_heads = 0
     if is_vlm and isinstance(cfg.get("vision_config"), dict):
-        vision_params = _vision_param_count(cfg["vision_config"])
+        vision_cfg = cfg["vision_config"]
+        vision_params = _vision_param_count(vision_cfg)
+        vision_num_heads = int(
+            vision_cfg.get("num_attention_heads")
+            or vision_cfg.get("num_heads")
+            or 0
+        )
 
     # MoE detection - do this BEFORE reading intermediate_size to avoid picking wrong field
     # Check multiple field names used by different MoE architectures
@@ -323,6 +684,41 @@ def parse_dims(cfg: dict) -> ModelDims:
             f"This calculator only handles decoder-only LLMs reliably."
         )
 
+    window = _sliding_window(cfg, text_cfg)
+    layout = _classify_layers(cfg, text_cfg, family, int(num_layers), window)
+    if not layout["sliding"]:
+        # The config named a window but nothing said which layers use it.
+        window = 0
+
+    state = _state_geometry(cfg, text_cfg, int(hidden)) or {}
+    if layout["recurrent"] and not state:
+        searched = ", ".join((
+            "linear_num_value_heads/linear_key_head_dim/linear_value_head_dim/"
+            "linear_conv_kernel_dim (gated delta net)",
+            "mamba_d_state/state_size/ssm_state_size/d_state",
+            "mamba_d_conv/conv_kernel/d_conv",
+            "mamba_d_ssm/mamba_expand/mamba_intermediate_size/d_inner",
+        ))
+        sys.exit(
+            f"{arch} / {family} reports {layout['recurrent']} recurrent "
+            f"(state-space) layer(s) via '{layout['layout_source']}', but no "
+            f"recurrent-state geometry could be read from the config. Without "
+            f"it the state pool -- which does not shrink with context and "
+            f"often dominates KV on hybrids -- cannot be sized, and a verdict "
+            f"would be confidently wrong.\n"
+            f"Keys searched: {searched}.\n"
+            f"If this family names them differently, pass a local config.json "
+            f"with the equivalent keys added, or file an issue with the "
+            f"architecture name."
+        )
+
+    model_dtype = _normalize_dtype(cfg.get("torch_dtype")
+                                   or text_cfg.get("torch_dtype"))
+    ssm_dtype = _normalize_dtype(
+        _lookup([text_cfg, cfg], ("mamba_ssm_cache_dtype", "ssm_cache_dtype"))[0],
+        default=model_dtype,
+    )
+
     return ModelDims(
         arch_family=family,
         hidden=hidden,
@@ -341,7 +737,45 @@ def parse_dims(cfg: dict) -> ModelDims:
         dense_intermediate=int(dense_intermediate),
         is_vlm=is_vlm,
         vision_params=vision_params,
+        vision_num_heads=vision_num_heads,
+        num_full_attn_layers=layout["full"],
+        num_sliding_attn_layers=layout["sliding"],
+        num_recurrent_layers=layout["recurrent"],
+        num_ffn_layers=layout["ffn"],
+        sliding_window=window,
+        num_state_heads=state.get("num_state_heads", 0),
+        state_head_dim_k=state.get("state_head_dim_k", 0),
+        state_head_dim_v=state.get("state_head_dim_v", 0),
+        conv_dim=state.get("conv_dim", 0),
+        conv_kernel=state.get("conv_kernel", 0),
+        state_size=state.get("state_size", 0),
+        state_groups=state.get("state_groups", 1),
+        state_inner=state.get("state_inner", 0),
+        conv_dtype=model_dtype,
+        ssm_dtype=ssm_dtype,
+        attn_on_recurrent_layers=layout["attn_on_recurrent"],
+        state_source=state.get("state_source", []),
     )
+
+
+def _recurrent_block_params(d: ModelDims) -> int:
+    """Weights of one recurrent (Mamba / Mamba2 / gated-delta-net) layer.
+
+    Mamba2 and gated-delta-net differ in how they name their projections but
+    land on the same shapes: one input projection wide enough to feed the
+    conv state plus the value stream, a depthwise conv, and one output
+    projection back to hidden. The per-head scalars (A_log, D, dt_bias) and
+    the gated output norm are small but cheap to include.
+    """
+    if not d.num_state_heads:
+        return 0
+    h = d.hidden
+    in_proj = h * (d.conv_dim + d.state_inner + 2 * d.num_state_heads)
+    conv = d.conv_dim * d.conv_kernel + d.conv_dim
+    out_proj = d.state_inner * h
+    scalars = 3 * d.num_state_heads
+    gate_norm = d.state_head_dim_v * d.num_state_heads
+    return in_proj + conv + out_proj + scalars + gate_norm
 
 
 def count_params(d: ModelDims) -> int:
@@ -355,8 +789,17 @@ def count_params(d: ModelDims) -> int:
         + h * kv_proj_dim  # K: hidden → num_kv_heads * head_dim
         + h * kv_proj_dim  # V: hidden → num_kv_heads * head_dim
         + q_proj_dim * h   # O: num_attn_heads * head_dim → hidden
+        + 2 * h            # input + post-attention norms
     )
-    norms = 4 * h
+
+    # Hybrids replace attention with an SSM on some layers, and families like
+    # Nemotron-H also have layers that carry neither. For a plain model all
+    # three counts collapse to num_layers.
+    attn_layers = d.num_full_attn_layers + d.num_sliding_attn_layers or d.num_layers
+    ffn_layers = d.num_ffn_layers or d.num_layers
+
+    total = attn_layers * attn_block
+    total += d.num_recurrent_layers * (_recurrent_block_params(d) + 2 * h)
 
     if d.is_moe:
         # Routed experts (standard MoE)
@@ -367,32 +810,131 @@ def count_params(d: ModelDims) -> int:
 
         # Hybrid MoE: DeepSeek-V2/V3/V4 replace first K layers with dense FFN
         if d.first_k_dense_replace > 0 and d.dense_intermediate > 0:
-            dense_ff_block = 3 * h * d.dense_intermediate
-            dense_layers = d.first_k_dense_replace
-            moe_layers = d.num_layers - dense_layers
-
-            dense_per_layer = attn_block + dense_ff_block + norms
-            moe_per_layer = attn_block + moe_ff_block + norms
-
-            emb = d.vocab * h
-            head = 0 if d.tied else d.vocab * h
-            return emb + head + (dense_layers * dense_per_layer) + (moe_layers * moe_per_layer)
+            dense_layers = min(d.first_k_dense_replace, ffn_layers)
+            total += dense_layers * 3 * h * d.dense_intermediate
+            total += (ffn_layers - dense_layers) * moe_ff_block
         else:
             # Pure MoE: all layers use expert FFN
-            per_layer = attn_block + moe_ff_block + norms
+            total += ffn_layers * moe_ff_block
     else:
         # Dense model
-        ff_block = 3 * h * d.intermediate
-        per_layer = attn_block + ff_block + norms
+        total += ffn_layers * 3 * h * d.intermediate
+    total += ffn_layers * 2 * h   # pre-FFN norm + residual norm
 
     emb = d.vocab * h
     head = 0 if d.tied else d.vocab * h
-    return emb + head + d.num_layers * per_layer
+    return emb + head + total
 
 
-def kv_bytes(d: ModelDims, ctx: int, concurrency: int, kv_dtype: str) -> int:
-    per_token = 2 * d.num_layers * d.num_kv_heads * d.head_dim
-    return int(per_token * ctx * concurrency * BYTES_PER_KV[kv_dtype])
+def default_max_num_batched_tokens(device_vram_gb: float) -> int:
+    """vLLM's default --max-num-batched-tokens for an OpenAI API server.
+
+    vLLM picks this from a device-memory tier table; only parts at or above
+    70 GiB get the 8192 tier. It matters here because it sets how many
+    uncommitted tokens a sliding-window block pool must be able to hold.
+    """
+    if device_vram_gb >= VLLM_LARGE_DEVICE_GIB:
+        return VLLM_MAX_NUM_BATCHED_TOKENS_LARGE
+    return VLLM_MAX_NUM_BATCHED_TOKENS_SMALL
+
+
+def max_in_flight_tokens(device_vram_gb: float) -> int:
+    """Tokens vLLM must keep addressable beyond a sliding window.
+
+    A windowed layer can only drop a block once every token in it has left
+    the window, and vLLM sizes that slack at two scheduler batches.
+    """
+    return 2 * default_max_num_batched_tokens(device_vram_gb)
+
+
+def sliding_ctx(d: ModelDims, ctx: int, runtime: str,
+                in_flight_tokens: int) -> int:
+    """Tokens a sliding-window layer must hold per request.
+
+    The three runtimes charge visibly different amounts for the same window:
+
+    * vllm pages the window and cannot free a block until every token in it
+      has left the window, so it holds `window - 1` plus the tokens still in
+      flight across the current batches.
+    * sglang sizes the window pool as a fraction of the full-attention pool
+      (--swa-full-tokens-ratio) instead of to the window, so the radix
+      prefix cache still has blocks to reuse.
+    * torch / transformers allocates exactly the window.
+    """
+    window = d.sliding_window
+    if not window:
+        return ctx
+    if runtime == "vllm":
+        return min(ctx, window - 1 + in_flight_tokens)
+    if runtime == "sglang":
+        pool = int(SGLANG_SWA_FULL_TOKENS_RATIO * ctx)
+        return min(ctx, max(window, pool))
+    return min(ctx, window)
+
+
+def kv_bytes(d: ModelDims, ctx: int, concurrency: int, kv_dtype: str,
+             runtime: str = "vllm", in_flight_tokens: int = 0) -> int:
+    """KV-cache bytes across every attention layer, before the TP divide.
+
+    Charged per layer rather than per model: a sliding-window layer holds a
+    bounded number of tokens no matter how long the context is, and a
+    recurrent layer holds no KV cache at all.
+    """
+    per_token_per_layer = 2 * d.num_kv_heads * d.head_dim * BYTES_PER_KV[kv_dtype]
+
+    full_layers = d.num_full_attn_layers
+    sliding_layers = d.num_sliding_attn_layers
+    if not (full_layers or sliding_layers):
+        # Pre-layout configs and direct ModelDims construction in callers.
+        full_layers = d.num_layers if not d.num_recurrent_layers else 0
+
+    tokens = full_layers * ctx
+    if sliding_layers:
+        tokens += sliding_layers * sliding_ctx(d, ctx, runtime, in_flight_tokens)
+    return int(per_token_per_layer * tokens * concurrency)
+
+
+def state_page_bytes(d: ModelDims, tp: int, runtime: str = "vllm") -> int:
+    """Recurrent-state bytes one request occupies, summed over SSM layers.
+
+    Both engines allocate this per running request and never shrink it with
+    context -- an SSM layer's state is the same size for 1 token as for 1M.
+    The conv state is (conv_dim, conv_kernel - 1): the current token is
+    computed, not stored, so the cache holds one fewer column than the
+    kernel is wide.
+    """
+    if not (d.num_recurrent_layers and d.num_state_heads):
+        return 0
+
+    # Head shards must divide the TP degree. vLLM pads the group/head count
+    # up to the next multiple rather than splitting a head across ranks, so
+    # sharding a hybrid at an awkward TP costs more state, not less.
+    conv_dim = _shard_padded(d.conv_dim, d.state_groups or 1, tp)
+    heads = _shard_padded(d.num_state_heads, d.num_state_heads, tp)
+
+    conv_bytes = conv_dim * max(d.conv_kernel - 1, 1)
+    conv_bytes *= BYTES_PER_STATE_DTYPE[d.conv_dtype]
+
+    ssm_dtype = "float32" if runtime == "sglang" else d.ssm_dtype
+    ssm_bytes = heads * d.state_head_dim_k * d.state_head_dim_v
+    ssm_bytes *= BYTES_PER_STATE_DTYPE[ssm_dtype]
+
+    return int((conv_bytes + ssm_bytes) * d.num_recurrent_layers)
+
+
+def _shard_padded(total: int, shardable_units: int, tp: int) -> int:
+    """Per-rank size of `total` split `tp` ways along `shardable_units`.
+
+    When the unit count does not divide TP, vLLM adds padding units
+    (extra_groups_for_head_shards) so each rank owns whole units.
+    """
+    if tp <= 1 or shardable_units <= 0:
+        return total
+    if shardable_units % tp == 0:
+        return total // tp
+    padded_units = shardable_units + (tp - shardable_units % tp)
+    per_unit = total / shardable_units
+    return int(per_unit * padded_units / tp)
 
 
 def activation_bytes(d: ModelDims, ctx: int, concurrency: int, dtype: str) -> int:
@@ -405,41 +947,252 @@ def fmt_gb(b: int) -> str:
     return f"{b / GB:6.2f} GB"
 
 
+# Every key a quantization_config can use to list modules left at full
+# precision. Exporters disagree on the name but agree on the meaning, so the
+# union is read rather than picking one.
+_EXCLUSION_KEYS = (
+    "modules_to_not_convert",   # gpt-oss (mxfp4), bitsandbytes 4-bit, some GPTQ
+    "ignore",                   # compressed-tensors
+    "ignored_layers",           # TensorRT Model Optimizer
+    "exclude_modules",          # AutoRound
+    "exclude",                  # some AWQ exports
+    "llm_int8_skip_modules",    # bitsandbytes int8
+)
+
+# Canonical module names used to ask "would this component be quantized?".
+# They are probes, not a claim about any one checkpoint's naming: an
+# exclusion entry is matched against every probe for a component.
+_COMPONENT_PROBES = {
+    "attn": (
+        "model.layers.0.self_attn.q_proj", "model.layers.0.self_attn.k_proj",
+        "model.layers.0.self_attn.v_proj", "model.layers.0.self_attn.o_proj",
+        "model.layers.0.attention.wqkv",
+    ),
+    "state": (
+        "model.layers.0.linear_attn.in_proj_qkvz",
+        "model.layers.0.linear_attn.out_proj",
+        "model.layers.0.mamba.in_proj", "model.layers.0.mamba.out_proj",
+        "model.layers.0.mixer.in_proj",
+    ),
+    "router": (
+        "model.layers.0.mlp.gate", "model.layers.0.mlp.router",
+        "model.layers.0.block_sparse_moe.gate", "model.layers.0.mlp.gate.wg",
+    ),
+    "ffn": (
+        "model.layers.0.mlp.down_proj", "model.layers.0.mlp.gate_proj",
+        "model.layers.0.mlp.up_proj", "model.layers.0.mlp.experts.0.down_proj",
+    ),
+    "vision": (
+        "visual.blocks.0.attn.qkv", "visual.blocks.0.mlp.down_proj",
+        "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj",
+        "vision_model.encoder.layers.0.mlp.fc1",
+    ),
+    "lm_head": ("lm_head", "language_model.lm_head"),
+}
+
+
+def _pattern_matches(pattern: str, name: str) -> bool:
+    """Match one exclusion entry against a module name.
+
+    Three spellings are in use and all three have to work, because a
+    checkpoint that names attention in a form this misses gets charged the
+    quantized rate for tensors that are stored at full width:
+
+    * `re:` prefix -- compressed-tensors. The rest is a regular expression
+      applied with `re.match`, so it is anchored at the start of the name.
+    * shell globs -- `model.layers.*.self_attn`, common in
+      modules_to_not_convert. A pattern naming a parent also covers its
+      children, so the glob is retried with a `.*` suffix.
+    * anything else -- a plain substring test.
+    """
+    if pattern.startswith("re:"):
+        try:
+            return re.match(pattern[3:], name) is not None
+        except re.error:
+            return False
+    if "*" in pattern or "?" in pattern or "[" in pattern:
+        return (fnmatch.fnmatchcase(name, pattern)
+                or fnmatch.fnmatchcase(name, pattern.rstrip(".") + ".*"))
+    return pattern in name
+
+
+def exclusion_patterns(qcfg: dict) -> list[str]:
+    """Every module pattern a quantization_config leaves at full precision."""
+    patterns: list[str] = []
+    for key in _EXCLUSION_KEYS:
+        value = qcfg.get(key)
+        if isinstance(value, str):
+            patterns.append(value)
+        elif isinstance(value, (list, tuple)):
+            patterns.extend(str(entry) for entry in value)
+    return patterns
+
+
+def _component_excluded(patterns: list[str], component: str) -> bool:
+    """True if any exclusion pattern covers this component's modules."""
+    probes = _COMPONENT_PROBES[component]
+    return any(_pattern_matches(p, probe) for p in patterns for probe in probes)
+
+
+def _lm_head_quantized(qcfg: dict) -> bool:
+    """True only if the config asks for the output projection to be quantized.
+
+    The default is the other way round: AWQ and GPTQ carry an explicit
+    `lm_head: true` when they want it, and compressed-tensors has to name it
+    in a config group's `targets`.
+    """
+    if qcfg.get("lm_head") is True:
+        return True
+    groups = qcfg.get("config_groups")
+    if isinstance(groups, dict):
+        for group in groups.values():
+            if not isinstance(group, dict):
+                continue
+            targets = group.get("targets") or []
+            if isinstance(targets, str):
+                targets = [targets]
+            for target in targets:
+                if any(_pattern_matches(str(target), probe)
+                       for probe in _COMPONENT_PROBES["lm_head"]):
+                    return True
+    return False
+
+
+def _key_from_bits(bits: object, dtype: object = "") -> str | None:
+    """Map a declared weight bit-width onto a BYTES_PER_PARAM key."""
+    try:
+        width = int(bits)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    text = str(dtype or "").lower()
+    floating = any(token in text for token in
+                   ("float", "fp8", "fp4", "nvfp", "mxfp", "e4m3", "e5m2"))
+    if width == 16:
+        return "bf16"
+    if width == 8:
+        return "fp8" if floating else "int8"
+    if width == 4:
+        return "mxfp4" if floating else "int4"
+    if width == 3:
+        return "int3"
+    if width == 2:
+        return "int2"
+    return None
+
+
+def detect_quant(cfg: dict) -> str | None:
+    """Weight format a pre-quantized checkpoint declares, or None.
+
+    Reading `quant_method` alone misses most checkpoints, because the common
+    values ("compressed-tensors", "awq", "gptq", "bitsandbytes") name the
+    container rather than the width. The width itself is declared elsewhere,
+    so it is read from wherever the exporter put it.
+    """
+    qcfg = cfg.get("quantization_config")
+    if not isinstance(qcfg, dict):
+        return None
+
+    method = str(qcfg.get("quant_method", "")).lower()
+    if method in BYTES_PER_PARAM:
+        return method
+
+    if qcfg.get("load_in_4bit"):
+        return "int4"
+    if qcfg.get("load_in_8bit"):
+        return "int8"
+
+    key = _key_from_bits(
+        qcfg.get("bits") or qcfg.get("weight_bits") or qcfg.get("w_bit"),
+        qcfg.get("weight_dtype") or qcfg.get("data_type") or method,
+    )
+    if key:
+        return key
+
+    # compressed-tensors declares the width per config group.
+    groups = qcfg.get("config_groups")
+    if isinstance(groups, dict):
+        found = []
+        for group in groups.values():
+            weights = group.get("weights") if isinstance(group, dict) else None
+            if isinstance(weights, dict):
+                key = _key_from_bits(weights.get("num_bits"), weights.get("type"))
+                if key:
+                    found.append(key)
+        if found:
+            # Widest declared width wins, so a mixed export is never charged
+            # less than its largest tensors actually cost.
+            return max(found, key=lambda name: BYTES_PER_PARAM[name])
+
+    # Model Optimizer and TensorRT exports name the recipe, not the width.
+    algo = str(qcfg.get("quant_algo") or qcfg.get("fmt") or "").lower()
+    for token, key in (("fp8", "fp8"), ("nvfp4", "mxfp4"), ("mxfp4", "mxfp4"),
+                       ("w4a16", "int4"), ("int4", "int4"),
+                       ("w8a8", "int8"), ("int8", "int8")):
+        if token in algo:
+            return key
+    return None
+
+
 def calculate_mixed_precision_weights(cfg: dict, d: ModelDims, params: int,
                                        quant: str, tp: int) -> tuple[int, dict | None]:
     """Calculate weight bytes accounting for mixed-precision quantization.
 
-    Some models (e.g., openai/gpt-oss-20b) use quantization_config.modules_to_not_convert
-    to keep certain components at full precision while quantizing others.
+    No production quantization scheme converts every tensor. The embedding
+    table is always left alone, output projections usually are, and many
+    checkpoints also exempt attention or the router
+    (quantization_config.ignore, modules_to_not_convert, and four other
+    spellings of the same list). Charging every parameter at the quantized
+    rate therefore under-estimates weights, which is the dangerous
+    direction: it reports FITS for a launch that runs out of memory.
 
     Returns:
         (weights_bytes, breakdown_dict or None)
     """
+    quant_bpp = BYTES_PER_PARAM[quant]
+    full_bpp = 2.0
+
+    # Both engines tensor-parallel the vision tower by default (vLLM's
+    # mm_encoder_tp_mode defaults to "weights"), so it is divided like the
+    # rest. The exception is a tower whose head count does not divide TP:
+    # there is no valid split, so every rank holds a full copy.
+    vision_replicated = bool(
+        d.vision_params and tp > 1
+        and (not d.vision_num_heads or d.vision_num_heads % tp)
+    )
+
+    if quant_bpp >= full_bpp:
+        # Nothing is quantized, so there is no mix to break down.
+        weights = params * quant_bpp / tp
+        if vision_replicated:
+            weights += d.vision_params * quant_bpp * (1 - 1 / tp)
+        return int(weights), None
+
     qcfg = cfg.get("quantization_config", {})
-    modules_to_not_convert = qcfg.get("modules_to_not_convert", [])
+    if not isinstance(qcfg, dict):
+        qcfg = {}
+    patterns = exclusion_patterns(qcfg)
 
-    # If no selective quantization, use uniform quantization
-    if not modules_to_not_convert:
-        return int(params * BYTES_PER_PARAM[quant] / tp), None
+    # Embedding tables are structurally out of reach of every scheme here:
+    # compressed-tensors, AWQ, GPTQ and mxfp4 all target Linear modules, and
+    # nn.Embedding is not one. No config will ever list the embedding table,
+    # so this is an invariant rather than something to probe for.
+    keep_embeddings = True
+    keep_lm_head = (_component_excluded(patterns, "lm_head")
+                    or not _lm_head_quantized(qcfg))
+    keep_attn = _component_excluded(patterns, "attn")
+    keep_state = _component_excluded(patterns, "state")
+    keep_router = _component_excluded(patterns, "router")
+    keep_ffn = _component_excluded(patterns, "ffn")
+    keep_vision = _component_excluded(patterns, "vision")
 
-    # Parse which modules to keep at full precision
-    keep_embeddings = any("embed" in m or "lm_head" in m for m in modules_to_not_convert)
-    keep_attn = any("attn" in m for m in modules_to_not_convert)
-    keep_router = any("router" in m for m in modules_to_not_convert)
-
-    # If not selectively quantizing recognizable components, fall back to uniform
-    if not (keep_embeddings or keep_attn):
-        return int(params * BYTES_PER_PARAM[quant] / tp), None
-
-    # Calculate component sizes
     h = d.hidden
     vocab = d.vocab
-    layers = d.num_layers
 
-    # Embeddings + LM head
-    embed_params = vocab * h * (1 if d.tied else 2)
+    embed_params = vocab * h
+    head_params = 0 if d.tied else vocab * h
 
-    # Attention blocks per layer
+    # Attention blocks, over attention layers only -- a hybrid's recurrent
+    # layers have no Q/K/V/O projections to quantize.
     q_proj_dim = d.num_attn_heads * d.head_dim
     kv_proj_dim = d.num_kv_heads * d.head_dim
     attn_per_layer = (
@@ -449,44 +1202,45 @@ def calculate_mixed_precision_weights(cfg: dict, d: ModelDims, params: int,
         q_proj_dim * h +      # O
         4 * h                 # norms
     )
-    attn_params = layers * attn_per_layer
+    attn_layers = d.num_full_attn_layers + d.num_sliding_attn_layers or d.num_layers
+    attn_params = attn_layers * attn_per_layer
+
+    state_params = d.num_recurrent_layers * _recurrent_block_params(d)
 
     # Router params (small, approximate as 2 * hidden per layer for MoE)
-    router_params = 0
-    if d.is_moe and keep_router:
-        router_params = layers * 2 * h
+    router_params = d.num_layers * 2 * h if d.is_moe else 0
 
     # FFN/Expert params = remaining
-    ffn_params = params - embed_params - attn_params - router_params - d.vision_params
+    ffn_params = max(
+        params - embed_params - head_params - attn_params - state_params
+        - router_params - d.vision_params,
+        0,
+    )
 
-    # Calculate bytes (bf16 = 2.0 for non-quantized, quant for quantized)
-    bf16_bpp = 2.0
-    quant_bpp = BYTES_PER_PARAM[quant]
+    components = [
+        ("embed", embed_params, keep_embeddings),
+        ("head", head_params, keep_lm_head),
+        ("attn", attn_params, keep_attn),
+        ("state", state_params, keep_state),
+        ("router", router_params, keep_router),
+        ("ffn", ffn_params, keep_ffn),
+        ("vision", d.vision_params, keep_vision),
+    ]
 
-    embed_bytes = embed_params * (bf16_bpp if keep_embeddings else quant_bpp)
-    attn_bytes = attn_params * (bf16_bpp if keep_attn else quant_bpp)
-    router_bytes = router_params * (bf16_bpp if keep_router else quant_bpp)
-    ffn_bytes = ffn_params * quant_bpp
-    vision_bytes = d.vision_params * (bf16_bpp if keep_embeddings else quant_bpp)
+    breakdown: dict = {}
+    total_bytes = 0.0
+    for name, count, keep in components:
+        bpp = full_bpp if keep else quant_bpp
+        divisor = 1 if (name == "vision" and vision_replicated) else tp
+        component_bytes = count * bpp * tp / divisor
+        total_bytes += component_bytes
+        breakdown[f"{name}_params"] = count
+        breakdown[f"{name}_bytes"] = int(count * bpp / divisor)
+        breakdown[f"{name}_bpp"] = bpp
+    breakdown["vision_replicated"] = vision_replicated
+    breakdown["excluded_patterns"] = patterns
 
-    total_bytes = int((embed_bytes + attn_bytes + router_bytes + ffn_bytes + vision_bytes) / tp)
-
-    breakdown = {
-        "embed_params": embed_params,
-        "embed_bytes": int(embed_bytes / tp),
-        "embed_bpp": bf16_bpp if keep_embeddings else quant_bpp,
-        "attn_params": attn_params,
-        "attn_bytes": int(attn_bytes / tp),
-        "attn_bpp": bf16_bpp if keep_attn else quant_bpp,
-        "router_params": router_params,
-        "router_bytes": int(router_bytes / tp),
-        "router_bpp": bf16_bpp if keep_router else quant_bpp,
-        "ffn_params": ffn_params,
-        "ffn_bytes": int(ffn_bytes / tp),
-        "ffn_bpp": quant_bpp,
-    }
-
-    return total_bytes, breakdown
+    return int(total_bytes / tp), breakdown
 
 
 def estimate(cfg: dict, quant: str, kv_dtype: str, ctx: int,
@@ -500,15 +1254,22 @@ def estimate(cfg: dict, quant: str, kv_dtype: str, ctx: int,
 
     # KV cache is sharded by attention heads (divided by TP)
     # Each GPU stores KV cache only for its subset of heads
-    kv = kv_bytes(d, ctx, concurrency, kv_dtype) // tp
+    in_flight = max_in_flight_tokens(device_vram_gb)
+    kv = kv_bytes(d, ctx, concurrency, kv_dtype, runtime, in_flight) // tp
+
+    # Recurrent state is allocated per running request and does not shrink
+    # with context, so it is charged alongside the KV cache rather than
+    # inside it. It is already per-rank: state_page_bytes applies the shard.
+    state_page = state_page_bytes(d, tp, runtime)
+    state = state_page * concurrency
+
     act = activation_bytes(d, ctx, concurrency,
                            quant if quant in ("bf16", "fp16") else "bf16")
     framework = int(FRAMEWORK_OVERHEAD_GB[runtime] * GB)
-    total = weights + kv + act + framework
+    total = weights + kv + state + act + framework
     device_b = int(device_vram_gb * GB)
     usable_b = int(device_b * gpu_memory_utilization)
     free_for_kv = usable_b - weights - act - framework
-    kv_per_token = max(kv_bytes(d, 1, 1, kv_dtype) // tp, 1)
     # Base footprint (weights + act + framework) can exceed usable VRAM, in
     # which case free_for_kv is negative and there is no room for any KV.
     # Clamp to 0 here so callers (TP sweep, single-result print) see a
@@ -517,13 +1278,22 @@ def estimate(cfg: dict, quant: str, kv_dtype: str, ctx: int,
         max_concurrency = 0
         max_context = 0
     else:
-        max_concurrency = free_for_kv // max(kv_per_token * ctx, 1)
-        max_context = free_for_kv // max(kv_per_token * max(concurrency, 1), 1)
+        per_request = kv_bytes(d, ctx, 1, kv_dtype, runtime, in_flight) // tp
+        max_concurrency = free_for_kv // max(per_request + state_page, 1)
+        max_context = _max_context(d, kv_dtype, max(concurrency, 1), tp,
+                                   runtime, in_flight,
+                                   free_for_kv - state_page * max(concurrency, 1))
     return {
         "dims": d,
         "params": params,
         "weights": weights,
         "kv": kv,
+        "state": state,
+        "state_page": state_page,
+        "state_slots": concurrency if state_page else 0,
+        "in_flight_tokens": in_flight,
+        "sliding_ctx": sliding_ctx(d, ctx, runtime, in_flight)
+                       if d.num_sliding_attn_layers else 0,
         "act": act,
         "framework": framework,
         "total": total,
@@ -537,6 +1307,28 @@ def estimate(cfg: dict, quant: str, kv_dtype: str, ctx: int,
     }
 
 
+def _max_context(d: ModelDims, kv_dtype: str, concurrency: int, tp: int,
+                 runtime: str, in_flight: int, budget: int) -> int:
+    """Largest context whose KV cache fits in `budget` bytes.
+
+    Solved by bisection rather than dividing by a per-token cost, because on
+    a sliding-window model the cost stops growing once the window is full --
+    dividing would report a ceiling far below the real one.
+    """
+    if budget <= 0:
+        return 0
+    low, high = 0, 1 << 24
+    if kv_bytes(d, high, concurrency, kv_dtype, runtime, in_flight) // tp <= budget:
+        return high
+    while low < high - 1:
+        mid = (low + high) // 2
+        if kv_bytes(d, mid, concurrency, kv_dtype, runtime, in_flight) // tp <= budget:
+            low = mid
+        else:
+            high = mid
+    return low
+
+
 def verdict_cell(result: dict, usable_vram_gb: float) -> str:
     if result["fits"]:
         headroom_gb = result["headroom"] / GB
@@ -546,6 +1338,7 @@ def verdict_cell(result: dict, usable_vram_gb: float) -> str:
     parts = [
         ("weights", result["weights"]),
         ("KV", result["kv"]),
+        ("state", result["state"]),
         ("activations", result["act"]),
         ("framework", result["framework"]),
     ]
@@ -620,6 +1413,7 @@ def print_tp_sweep(cfg: dict, args: argparse.Namespace, tp_values: list[int]) ->
             tp,
             result["weights"],
             result["kv"],
+            result["state"],
             result["act"],
             result["framework"],
             result["total"],
@@ -631,15 +1425,22 @@ def print_tp_sweep(cfg: dict, args: argparse.Namespace, tp_values: list[int]) ->
         if result["fits"] and first_fit is None:
             first_fit = tp
 
+    # The state column is dead weight for the overwhelmingly common case of a
+    # model with no recurrent layers, so only show it when there is state.
+    show_state = any(row[3] for row in rows)
+
     print()
     print("TP sweep")
-    print(f"  {'TP':>2}  {'weights':>9} {'KV':>9} {'act':>9} "
+    state_head = f"{'state':>9} " if show_state else ""
+    print(f"  {'TP':>2}  {'weights':>9} {'KV':>9} {state_head}{'act':>9} "
           f"{'fw':>9} {'total':>9} {'headroom':>9} "
           f"{'fit':>3}  {'max_c':>5}  {'max_ctx':>7}")
-    print("  " + "-" * 83)
-    for tp, weights, kv, act, framework, total, headroom, fits, max_c, max_ctx in rows:
+    print("  " + "-" * (93 if show_state else 83))
+    for (tp, weights, kv, state, act, framework, total, headroom,
+         fits, max_c, max_ctx) in rows:
         verdict = "YES" if fits else "NO"
-        print(f"  {tp:>2}  {fmt_gb(weights)} {fmt_gb(kv)} {fmt_gb(act)} "
+        state_cell = f"{fmt_gb(state)} " if show_state else ""
+        print(f"  {tp:>2}  {fmt_gb(weights)} {fmt_gb(kv)} {state_cell}{fmt_gb(act)} "
               f"{fmt_gb(framework)} {fmt_gb(total)} {fmt_gb(headroom)} "
               f"{verdict:>3}  {max_c:>5}  {max_ctx:>7}")
     if first_fit is None:
@@ -712,10 +1513,9 @@ def main(argv: list[str] | None = None) -> int:
     # Auto-detect pre-quantized models from config if --quant not specified
     auto_quant = False
     if args.quant is None:
-        qcfg = cfg.get("quantization_config", {})
-        quant_method = qcfg.get("quant_method", "").lower()
-        if quant_method in BYTES_PER_PARAM:
-            args.quant = quant_method
+        detected = detect_quant(cfg)
+        if detected:
+            args.quant = detected
             auto_quant = True
         else:
             args.quant = "bf16"
@@ -738,14 +1538,42 @@ def main(argv: list[str] | None = None) -> int:
     fits = result["fits"]
     headroom = result["headroom"]
 
+    state = result["state"]
+
     arch_label = "decoder-only LLM"
     if d.is_moe:
         arch_label = "MoE"
+    if d.num_recurrent_layers:
+        arch_label = "hybrid SSM + attention" if (
+            d.num_full_attn_layers or d.num_sliding_attn_layers
+        ) else "state-space model"
+        if d.is_moe:
+            arch_label += ", MoE"
+    elif d.num_sliding_attn_layers:
+        arch_label += ", sliding-window attention"
     if d.is_vlm:
         arch_label = "VLM (LLM backbone + vision tower)"
 
     print(f"Model:             {args.model}")
     print(f"Architecture:      {d.arch_family}  ({arch_label})")
+    if d.num_recurrent_layers or d.num_sliding_attn_layers:
+        pieces = []
+        if d.num_full_attn_layers:
+            pieces.append(f"{d.num_full_attn_layers} full attention")
+        if d.num_sliding_attn_layers:
+            pieces.append(f"{d.num_sliding_attn_layers} sliding "
+                          f"(window {d.sliding_window})")
+        if d.num_recurrent_layers:
+            pieces.append(f"{d.num_recurrent_layers} recurrent")
+        print(f"Layers:            {d.num_layers} total: {', '.join(pieces)}")
+        if d.attn_on_recurrent_layers:
+            print("                   (attention and SSM run in the same "
+                  "layer, so both are charged)")
+        if d.num_recurrent_layers:
+            print(f"Recurrent state:   {d.num_state_heads} head(s) x "
+                  f"{d.state_head_dim_k} x {d.state_head_dim_v}, conv "
+                  f"{d.conv_dim} x {d.conv_kernel - 1}  "
+                  f"({result['state_page'] / MB:.1f} MiB per request)")
     if d.is_moe:
         expert_str = f"{d.num_experts} routed"
         if d.num_shared_experts:
@@ -791,26 +1619,37 @@ def main(argv: list[str] | None = None) -> int:
     if mixed_breakdown:
         print()
         print("Mixed-precision weight breakdown:")
-        if mixed_breakdown["embed_params"] > 0:
-            print(f"  Embeddings      {fmt_gb(mixed_breakdown['embed_bytes'])}   "
-                  f"({mixed_breakdown['embed_params']/1e9:.2f}B params @ {mixed_breakdown['embed_bpp']:.2f} B/p)")
-        if mixed_breakdown["attn_params"] > 0:
-            print(f"  Attention       {fmt_gb(mixed_breakdown['attn_bytes'])}   "
-                  f"({mixed_breakdown['attn_params']/1e9:.2f}B params @ {mixed_breakdown['attn_bpp']:.2f} B/p)")
-        if mixed_breakdown["router_params"] > 0:
-            print(f"  Routers         {fmt_gb(mixed_breakdown['router_bytes'])}   "
-                  f"({mixed_breakdown['router_params']/1e9:.2f}B params @ {mixed_breakdown['router_bpp']:.2f} B/p)")
-        if mixed_breakdown["ffn_params"] > 0:
-            print(f"  FFN/Experts     {fmt_gb(mixed_breakdown['ffn_bytes'])}   "
-                  f"({mixed_breakdown['ffn_params']/1e9:.2f}B params @ {mixed_breakdown['ffn_bpp']:.2f} B/p)")
+        for key, label in (("embed", "Embeddings"), ("head", "Output head"),
+                           ("attn", "Attention"), ("state", "SSM / conv"),
+                           ("router", "Routers"), ("ffn", "FFN/Experts"),
+                           ("vision", "Vision tower")):
+            # Below 5M params both columns round to 0.00 and the line is noise.
+            if mixed_breakdown[f"{key}_params"] < 5_000_000:
+                continue
+            print(f"  {label:<15} {fmt_gb(mixed_breakdown[f'{key}_bytes'])}   "
+                  f"({mixed_breakdown[f'{key}_params']/1e9:.2f}B params "
+                  f"@ {mixed_breakdown[f'{key}_bpp']:.2f} B/p)")
         print(f"  -----              -----")
         print(f"  Weights total   {fmt_gb(weights)}")
+        if mixed_breakdown["vision_replicated"]:
+            print(f"  (vision tower replicated on every rank: its "
+                  f"{d.vision_num_heads or 'unknown'} head(s) do not divide "
+                  f"TP {args.tp})")
 
     print()
     print("VRAM breakdown")
     print(f"  Weights         {fmt_gb(weights)}")
-    print(f"  KV cache        {fmt_gb(kv)}   "
-          f"({args.ctx} tok x concurrency {args.concurrency}, kv_dtype {args.kv_dtype})")
+    kv_note = (f"({args.ctx} tok x concurrency {args.concurrency}, "
+               f"kv_dtype {args.kv_dtype})")
+    print(f"  KV cache        {fmt_gb(kv)}   {kv_note}")
+    if d.num_sliding_attn_layers and result["sliding_ctx"] < args.ctx:
+        print(f"                  {d.num_sliding_attn_layers} windowed layer(s) "
+              f"hold {result['sliding_ctx']} tok, not {args.ctx} "
+              f"({args.runtime} accounting)")
+    if state:
+        print(f"  Recurrent state {fmt_gb(state)}   "
+              f"({result['state_slots']} request slot(s) x "
+              f"{result['state_page'] / MB:.1f} MiB; independent of context)")
     print(f"  Activations     {fmt_gb(act)}   (estimate)")
     print(f"  Framework       {fmt_gb(framework)}   ({args.runtime})")
     print(f"  -----              -----")
@@ -856,29 +1695,52 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Verdict:           DOES NOT FIT  (deficit {fmt_gb(deficit)})")
 
     parts = sorted(
-        [("weights", weights), ("KV cache", kv), ("activations", act), ("framework", framework)],
-        key=lambda kv: -kv[1],
+        [("weights", weights), ("KV cache", kv), ("recurrent state", state),
+         ("activations", act), ("framework", framework)],
+        key=lambda item: -item[1],
     )
     binding, _ = parts[0]
     print(f"  Binding constraint: {binding} ({fmt_gb(parts[0][1])}) dominates")
+
+    in_flight = result["in_flight_tokens"]
+
+    def kv_at(ctx: int, concurrency: int, kv_dtype: str) -> int:
+        return kv_bytes(d, ctx, concurrency, kv_dtype, args.runtime,
+                        in_flight) // args.tp
 
     suggestions: list[str] = []
     if binding == "KV cache":
         if args.ctx > 1024:
             new_ctx = max(1024, args.ctx // 2)
-            new_kv = kv_bytes(d, new_ctx, args.concurrency, args.kv_dtype) // args.tp
+            new_kv = kv_at(new_ctx, args.concurrency, args.kv_dtype)
             suggestions.append(
                 f"drop ctx {args.ctx} -> {new_ctx} (saves {fmt_gb(kv - new_kv)})"
             )
         if args.kv_dtype in ("bf16", "fp16"):
-            new_kv = kv_bytes(d, args.ctx, args.concurrency, "fp8") // args.tp
+            new_kv = kv_at(args.ctx, args.concurrency, "fp8")
             suggestions.append(
                 f"kv-dtype {args.kv_dtype} -> fp8 (saves {fmt_gb(kv - new_kv)})"
             )
         if args.concurrency > 1:
-            new_kv = kv_bytes(d, args.ctx, 1, args.kv_dtype) // args.tp
+            new_kv = kv_at(args.ctx, 1, args.kv_dtype)
             suggestions.append(
                 f"concurrency {args.concurrency} -> 1 (saves {fmt_gb(kv - new_kv)})"
+            )
+    if binding == "recurrent state":
+        # The state pool scales only with the number of running requests --
+        # shortening the context does nothing for it.
+        if args.concurrency > 1:
+            new_concurrency = max(1, args.concurrency // 2)
+            saved = result["state_page"] * (args.concurrency - new_concurrency)
+            suggestions.append(
+                f"concurrency {args.concurrency} -> {new_concurrency} "
+                f"(saves {fmt_gb(saved)}; the state pool scales with running "
+                f"requests, not context)"
+            )
+        if args.tp == 1:
+            suggestions.append(
+                f"--tp 2 shards the state pool across two XPUs (saves about "
+                f"{fmt_gb(state - state_page_bytes(d, 2, args.runtime) * args.concurrency)})"
             )
     if binding == "weights":
         if args.quant in ("bf16", "fp16"):

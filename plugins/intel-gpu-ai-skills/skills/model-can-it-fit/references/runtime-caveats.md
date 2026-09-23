@@ -79,6 +79,30 @@ For a floor estimate, point the script at a component config such as the
 UNet or transformer subdirectory. For the real answer, use
 `torch-xpu-bench` with one run and read peak XPU memory.
 
+## Hybrid And Sliding-Window Caveats
+
+For a model with recurrent (state-space) layers, the state pool is charged
+per running request and does not shrink with context. Lowering `--ctx`
+therefore does little for a hybrid model whose state pool dominates;
+lowering `--concurrency` is the lever that works.
+
+The state pool is sensitive to `--tp`. When the state heads do not divide
+evenly by the tensor-parallel degree, the engine pads them out to a
+multiple of it, so a shard can cost more than `total / tp`. The script
+models that padding, which is why TP=3 on a 16-head model can look worse
+than expected.
+
+For a sliding-window model, the per-layer cache is bounded, so the KV
+curve flattens once the context passes the window. Raising `--ctx` past
+that point changes almost nothing, and the reported max context is found
+by search rather than by division.
+
+Switching `--runtime` changes both of these, because the engines size
+their pools differently. SGLang provisions its window pool as a fraction
+of the full-attention pool rather than from the window, and forces the SSM
+half of recurrent state to fp32. The same model can fit under vLLM and not
+under SGLang.
+
 ## What This Skill Does Not Predict
 
 - measured tokens/sec, TTFT, TPOT, or ITL
@@ -87,6 +111,23 @@ UNet or transformer subdirectory. For the real answer, use
 - pipeline-parallel sharding
 - diffusion peak memory
 - correctness or output quality after aggressive quantization
+- block-quantized and group-padded weight layouts. The bytes-per-parameter
+  table folds in a typical scale and zero-point overhead for group size
+  128. A checkpoint with a smaller group, per-block fp8 scales, or padded
+  output dimensions carries a little more than the estimate.
+- quantization recipes stated only in a sidecar file. NVIDIA modelopt
+  checkpoints put the recipe in `hf_quant_config.json`, which the script
+  does not read; pass `--quant` explicitly for those.
+- replicated projector weights on a sharded vision encoder. A multimodal
+  projector or merger that is not tensor-parallel is counted as sharded,
+  which understates the per-device total by up to about 0.16 GB.
+- decode-time bandwidth for hybrid models. A recurrent layer reads a fixed
+  state instead of a growing cache, so its decode cost does not scale with
+  context the way an attention layer's does. That is a throughput question,
+  not a memory one; use a benchmark skill.
+- SGLang's own recurrent-pool sizing. SGLang derives the number of state
+  slots from a memory fraction rather than from the requested concurrency,
+  so its actual pool can be larger than the per-request figure here.
 
 Use benchmark/profile skills for measured runtime behavior.
 
