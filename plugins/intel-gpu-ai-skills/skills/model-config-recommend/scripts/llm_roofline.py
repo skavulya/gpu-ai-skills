@@ -125,6 +125,10 @@ def main(argv: list[str] | None = None) -> int:
           f"heads={dims.num_attn_heads}, kv_heads={dims.num_kv_heads}")
     if dims.is_moe:
         print("Note:      MoE config detected; dense param estimate is a coarse bound.")
+    if dims.num_recurrent_layers:
+        print(f"Note:      {dims.num_recurrent_layers} recurrent layer(s) detected; "
+              f"they read a fixed state instead of a growing cache, so this "
+              f"context-scaled decode bound is pessimistic for them.")
     print(f"Device:    {device['name']} ({device['memory_bandwidth_gbs']} GB/s)")
     print(f"Runtime:   {args.runtime}")
     print(f"Quant:     {args.quant} ({quant['bytes_per_param']} B/param, "

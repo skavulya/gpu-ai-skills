@@ -2019,5 +2019,81 @@ class TestVisionTowerSharding:
             cfg, "bf16", "bf16", 4096, 1, 1, "vllm", 32.0)["weights"]
 
 
+class TestRecommenderParity:
+    """model-config-recommend must charge the same cache as model-can-it-fit.
+
+    The two skills are installed separately and cannot import each other, so
+    the layer-layout and state logic is duplicated. That duplication is only
+    safe if it is checked: a fix applied to one copy and not the other shows
+    up here as a disagreement rather than as two skills giving a user two
+    different verdicts for the same launch.
+    """
+
+    CASES = {
+        "dense": _dense_cfg(),
+        "sliding": _dense_cfg(model_type="mistral", sliding_window=4096),
+        "interleaved": _dense_cfg(
+            model_type="gpt_oss", num_hidden_layers=8, sliding_window=128,
+            layer_types=["sliding_attention", "full_attention"] * 4),
+        "hybrid": _dense_cfg(
+            model_type="qwen3_next", num_hidden_layers=8,
+            linear_conv_kernel_dim=4, linear_key_head_dim=128,
+            linear_num_key_heads=16, linear_num_value_heads=32,
+            linear_value_head_dim=128,
+            layer_types=["linear_attention"] * 6 + ["full_attention"] * 2),
+        "mamba2": _dense_cfg(
+            model_type="nemotron_h", num_hidden_layers=8,
+            hybrid_override_pattern="M-M-M-*-",
+            mamba_d_state=128, mamba_d_conv=4, mamba_num_heads=128,
+            mamba_head_dim=64, mamba_n_groups=8),
+    }
+
+    @staticmethod
+    def _recommend_common():
+        path = (git_root / 'plugins/intel-gpu-ai-skills/skills'
+                / 'model-config-recommend' / 'scripts')
+        sys.path.insert(0, str(path))
+        try:
+            import common
+        finally:
+            sys.path.remove(str(path))
+        return common
+
+    @pytest.mark.parametrize("case", sorted(CASES))
+    def test_layer_layout_matches(self, case):
+        common = self._recommend_common()
+        cfg = self.CASES[case]
+        mine, theirs = parse_dims(cfg), common.parse_model_dims(cfg)
+        assert mine.num_full_attn_layers == theirs.num_full_attn_layers
+        assert mine.num_sliding_attn_layers == theirs.num_sliding_attn_layers
+        assert mine.num_recurrent_layers == theirs.num_recurrent_layers
+        assert mine.sliding_window == theirs.sliding_window
+
+    @pytest.mark.parametrize("case", sorted(CASES))
+    def test_kv_and_state_bytes_match(self, case):
+        common = self._recommend_common()
+        cfg = self.CASES[case]
+        mine, theirs = parse_dims(cfg), common.parse_model_dims(cfg)
+        in_flight = fit.max_in_flight_tokens(32.0)
+        assert in_flight == common.max_in_flight_tokens(32.0)
+
+        for ctx in (2048, 32768):
+            assert (kv_bytes(mine, ctx, 4, "bf16", "vllm", in_flight)
+                    == common.kv_bytes(theirs, ctx, 4, 2.0, "vllm-xpu",
+                                       in_flight))
+        for tp in (1, 2, 3):
+            assert (fit.state_page_bytes(mine, tp, "vllm")
+                    == common.state_page_bytes(theirs, tp, "vllm-xpu"))
+
+    def test_sglang_state_dtype_matches(self):
+        common = self._recommend_common()
+        cfg = self.CASES["hybrid"]
+        mine, theirs = parse_dims(cfg), common.parse_model_dims(cfg)
+        assert (fit.state_page_bytes(mine, 1, "sglang")
+                == common.state_page_bytes(theirs, 1, "sglang"))
+        assert (fit.state_page_bytes(mine, 1, "sglang")
+                > fit.state_page_bytes(mine, 1, "vllm"))
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", "-s"]))

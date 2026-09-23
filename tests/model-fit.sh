@@ -134,4 +134,18 @@ python3 "$rec_py" \
 grep -q "Memory:    27.2 GB usable per GPU" "$rec"
 grep -q -- "--gpu-memory-utilization 0.85" "$rec"
 
+# The recommender must charge a hybrid model a state pool and report the layout.
+rec_hybrid="$tmpdir/recommend-hybrid.txt"
+python3 "$rec_py" \
+    --model "$hybrid_cfg" \
+    --device arc-pro-b70 --num-devices 2 \
+    --ctx 32768 --concurrency 4 \
+    --gpu-memory-utilization 0.85 \
+    --no-hub-search >"$rec_hybrid"
+
+grep -q "Layers:    4 total: 1 full attention, 3 recurrent" "$rec_hybrid"
+grep -q "GB state + " "$rec_hybrid"
+
+echo "OK model-config-recommend hybrid checks passed"
+
 echo "OK model-can-it-fit usable-memory checks passed"

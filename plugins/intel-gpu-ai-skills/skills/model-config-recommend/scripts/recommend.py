@@ -28,8 +28,11 @@ from common import (
     count_params,
     fetch_config,
     is_local_model,
+    kv_bytes,
     kv_bytes_per_token,
+    max_in_flight_tokens,
     parse_model_dims,
+    state_page_bytes,
 )
 from roofline import factors_from_dict, peak_ops_s, phase_roofline
 
@@ -190,6 +193,7 @@ class FitResult:
     fits: bool
     weights_gb: float
     kv_at_target_gb: float
+    state_gb: float          # recurrent (state-space) pool, 0 for attention-only
     activations_gb: float
     framework_gb: float
     total_gb: float
@@ -222,23 +226,37 @@ def evaluate_fit(d: ModelDims, params: int, quant: str, kv_dtype: str,
                  gpu_memory_utilization: float = 1.0) -> FitResult:
     bpp = HW["quants"][quant]["bytes_per_param"]
     weights = (params * bpp) / tp
-    kv_per_tok = kv_bytes_per_token(d, _kv_bytes(kv_dtype)) / tp
-    kv = kv_per_tok * ctx * concurrency
+    in_flight = max_in_flight_tokens(device_vram_gb)
+
+    def cache_for(ctx_: int, conc_: int) -> tuple[float, float]:
+        kv_ = kv_bytes(d, ctx_, conc_, _kv_bytes(kv_dtype), framework,
+                       in_flight) / tp
+        state_ = state_page_bytes(d, tp, framework) * conc_
+        return kv_, state_
+
+    kv, state = cache_for(ctx, concurrency)
     # Activation buffer: bounded estimate (residual + scratch).
     act = 2 * concurrency * ctx * d.hidden * 2 + 512 * 1024 ** 2
     fw = FRAMEWORK_OVERHEAD_GB[framework] * GB
-    total = weights + kv + act + fw
+    total = weights + kv + state + act + fw
     device_b = device_vram_gb * GB * gpu_memory_utilization
     headroom = device_b - total
 
-    # Capacity: how many requests fit at this context, OR how much context at this concurrency.
+    # Capacity: how many requests fit at this context, OR how much context at
+    # this concurrency. Both are searched rather than divided out: a windowed
+    # layer's cache stops growing past the window and a recurrent state never
+    # grows with context at all, so neither curve is a straight line through
+    # the origin.
     free = device_b - weights - act - fw
-    max_conc = max(0, int(free / max(kv_per_tok * ctx, 1)))
-    max_ctx = max(0, int(free / max(kv_per_tok * max(concurrency, 1), 1)))
+    max_conc = _largest_fitting(
+        lambda n: sum(cache_for(ctx, n)) <= free, 1 << 20)
+    max_ctx = _largest_fitting(
+        lambda n: sum(cache_for(n, max(concurrency, 1))) <= free, 1 << 24)
     return FitResult(
         fits=total <= device_b,
         weights_gb=weights / GB,
         kv_at_target_gb=kv / GB,
+        state_gb=state / GB,
         activations_gb=act / GB,
         framework_gb=fw / GB,
         total_gb=total / GB,
@@ -246,6 +264,22 @@ def evaluate_fit(d: ModelDims, params: int, quant: str, kv_dtype: str,
         max_concurrency=max_conc,
         max_context=max_ctx,
     )
+
+
+def _largest_fitting(fits: callable, upper: int) -> int:
+    """Largest n in [0, upper] with fits(n) true, assuming fits is monotone."""
+    if not fits(1):
+        return 0
+    if fits(upper):
+        return upper
+    low, high = 1, upper
+    while high - low > 1:
+        mid = (low + high) // 2
+        if fits(mid):
+            low = mid
+        else:
+            high = mid
+    return low
 
 
 def _kv_bytes(kv_dtype: str) -> float:
@@ -564,6 +598,32 @@ def quant_label(quant: str) -> str:
     return f"--quantization {quant}"
 
 
+def describe_layout(d: ModelDims) -> str:
+    """One line on a non-uniform layer layout, empty for plain full attention.
+
+    Worth printing because it changes which lever helps: a recurrent state
+    scales with concurrency and not context, and a windowed layer's cache
+    stops growing once the context passes the window.
+    """
+    if d.attn_on_recurrent_layers:
+        return (f"{d.num_layers} total: attention and an SSM in every layer -- "
+                f"each layer holds both a KV cache and a recurrent state")
+    parts = []
+    if d.num_recurrent_layers:
+        parts.append(f"{d.num_recurrent_layers} recurrent")
+    if d.num_sliding_attn_layers:
+        parts.append(f"{d.num_sliding_attn_layers} windowed "
+                     f"(window {d.sliding_window} tok)")
+    if not parts:
+        return ""
+    parts.insert(0, f"{d.num_full_attn_layers} full attention")
+    detail = ", ".join(parts)
+    note = ("recurrent state scales with concurrency, not context"
+            if d.num_recurrent_layers else
+            "windowed layers hold a bounded cache")
+    return f"{d.num_layers} total: {detail} -- {note}"
+
+
 def render(model_id: str, d: ModelDims, params: int, device: dict, framework: str,
            ctx: int, concurrency: int, candidates: list[Candidate],
            available_variants: dict, cfg: dict,
@@ -579,6 +639,13 @@ def render(model_id: str, d: ModelDims, params: int, device: dict, framework: st
     out.append(f"Runtime:   {framework} (vLLM-XPU launch/verification)")
     out.append(f"Devices:   {device.get('num_devices', 1)} x {device['name']}")
     out.append(f"Targets:   concurrency={concurrency}, context={ctx} tok")
+    layout = describe_layout(d)
+    if layout:
+        out.append(f"Layers:    {layout}")
+    if d.num_recurrent_layers:
+        out.append("Note:      recurrent layers are sized for cache, but the "
+                   "param count here is a dense approximation; use "
+                   "model-can-it-fit for their weight breakdown")
     out.append("")
     quant_candidates = {k: v for k, v in available_variants.items()
                         if k not in ("bf16", "fp8")}
@@ -600,8 +667,10 @@ def render(model_id: str, d: ModelDims, params: int, device: dict, framework: st
         layout = f"dp={c.dp}, tp={c.tp}"
         out.append(f"--- Candidate {i}: {quant_label(c.quant)}, --kv-cache-dtype "
                    f"{c.kv_dtype}, {layout} ---")
+        state_term = (f"{f.state_gb:.1f} GB state + " if f.state_gb else "")
         out.append(f"  Fit:       {f.weights_gb:.1f} GB weights + "
                    f"{f.kv_at_target_gb:.1f} GB KV + "
+                   f"{state_term}"
                    f"{f.activations_gb:.1f} GB act + "
                    f"{f.framework_gb:.1f} GB framework "
                    f"= {f.total_gb:.1f} GB / "

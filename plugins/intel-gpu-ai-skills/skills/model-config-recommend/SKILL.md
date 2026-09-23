@@ -170,7 +170,11 @@ context, larger concurrency) holds independently of throughput.
 
 ```
 weights     = params × bytes_per_param / tp
-kv_cache    = 2 × num_layers × num_kv_heads × head_dim × kv_dtype_bytes × ctx × concurrency / tp
+kv_per_tok_per_layer = 2 × num_kv_heads × head_dim × kv_dtype_bytes
+kv_cache    = kv_per_tok_per_layer × concurrency / tp
+            × (num_full_attention_layers × ctx
+               + num_windowed_layers × window_tokens)
+state       = recurrent_state_per_request × concurrency   # SSM layers only
 activations ≈ 2 × concurrency × ctx × hidden × dtype_bytes + 512 MiB
 framework   = vllm-xpu overhead (~2.0 GB)
 
@@ -180,6 +184,15 @@ TTFT          = prompt_tokens / prefill_tok_s
 single_stream_decode_tok_s = (mem_bw / weights_bytes) × BWE   # memory-bound
 TPOT_at_concurrency        = step time including KV traffic at (ctx, concurrency)
 ```
+
+The cache is charged per layer because the layer kinds cost different
+amounts. A windowed layer holds `window - 1` plus two scheduler batches
+under vLLM, so its cache stops growing once the context passes the
+window. A recurrent (state-space) layer holds no KV cache at all, only a
+fixed state per running request that does not shrink with context -- so
+for those models concurrency is the lever, not context. Because neither
+curve is a straight line, the reported maximum context and maximum
+concurrency are found by search rather than by division.
 
 MFU (compute efficiency) and BWE (bandwidth efficiency) live in
 `data/hardware.json` as ranges per runtime — see "Worked example"
