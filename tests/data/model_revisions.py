@@ -62,6 +62,11 @@ drop one without checking what stops being covered.
     gpt-oss-20b, gpt-oss-120b        pre-quantized mxfp4, mixed-precision path
     Llama-3.1-8B, Llama-3.3-70B      dense; matched against the HF KV calculator
     Gemma-2-9B, Gemma-2-27B          dense with an explicit head_dim=256
+    Qwen3-Next-80B-A3B               hybrid gated delta net; full_attention_interval
+    Nemotron-H-8B                    hybrid Mamba2; hybrid_override_pattern
+    Mistral-7B-Instruct-v0.1         sliding window applied to every layer
+    DeepSeek-R1-0528-quantized.w4a16 compressed-tensors int4 with `re:` excludes
+    Llama-3.1-8B-Instruct-FP8-dynamic  compressed-tensors fp8 by declared bit width
 
 Expected results are recorded in the "Layer 3a" section of HOW_TO_TEST.md.
 """
@@ -79,6 +84,15 @@ MODEL_REVISIONS = {
     "mistralai/Mixtral-8x7B-v0.1":        "fc7ac94680e38d7348cfa806e51218e6273104b0",  # 2025-07-24
     "openai/gpt-oss-20b":                 "6cee5e81ee83917806bbde320786a8fb61efebee",  # 2025-08-26
     "openai/gpt-oss-120b":                "b5c939de8f754692c1647ca79fbf85e8c1e70f8a",  # 2025-08-26
+
+    # Hybrid, sliding-window and mixed-precision paths. Pins taken 2026-09-22.
+    "Qwen/Qwen3-Next-80B-A3B-Instruct":   "9c7f2fbe84465e40164a94cc16cd30b6999b0cc7",  # 2025-09-17
+    "nvidia/Nemotron-H-8B-Base-8K":        "94ea861e008c2dfced3e8e1302094024077aa04e",  # 2025-08-21
+    "mistralai/Mistral-7B-Instruct-v0.1": "ec5deb64f2c6e6fa90c1abf74a91d5c93a9669ca",  # 2025-07-24
+    "RedHatAI/DeepSeek-R1-0528-quantized.w4a16":
+                                          "0efe34e82e4612e726c42f6fd44116e0244b33f8",  # 2026-04-28
+    "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic":
+                                          "442e7f522277df12f53d63e8384087af31fbfc4b",  # 2026-07-10
 
     # Gated: fetching config.json returns HTTP 401 without an accepted licence
     # and HF_TOKEN. Tests that need these skip when the fetch fails.

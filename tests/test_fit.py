@@ -1474,19 +1474,20 @@ class TestMixedPrecisionQuantization:
         # Check component breakdown exists
         assert breakdown["embed_params"] > 0, "Should have embedding params"
         assert breakdown["attn_params"] > 0, "Should have attention params"
-        assert breakdown["ffn_params"] > 0, "Should have FFN/expert params"
+        assert breakdown["expert_ffn_params"] > 0, "Should have expert params"
 
         # Embeddings and attention should be at bf16 (2.0 B/p)
         assert breakdown["embed_bpp"] == 2.0, "Embeddings should be bf16"
         assert breakdown["attn_bpp"] == 2.0, "Attention should be bf16"
 
         # FFN/experts should be at mxfp4 (0.55 B/p)
-        assert breakdown["ffn_bpp"] == 0.55, "FFN/experts should be mxfp4"
+        assert breakdown["expert_ffn_bpp"] == 0.55, "Experts should be mxfp4"
 
         # Sum of components should match total weights
         component_sum = sum(breakdown[f"{name}_bytes"] for name in
                             ("embed", "head", "attn", "state", "router",
-                             "ffn", "vision"))
+                             "dense_ffn", "shared_ffn", "expert_ffn",
+                             "vision"))
         assert abs(component_sum - weights_bytes) <= 1, \
             f"Component sum ({component_sum}) should match total weights ({weights_bytes})"
 
@@ -1532,7 +1533,7 @@ class TestMixedPrecisionQuantization:
         # Check precision assignments
         assert breakdown["embed_bpp"] == 2.0, "Embeddings should be bf16"
         assert breakdown["attn_bpp"] == 2.0, "Attention should be bf16"
-        assert breakdown["ffn_bpp"] == 0.55, "FFN/experts should be mxfp4"
+        assert breakdown["expert_ffn_bpp"] == 0.55, "Experts should be mxfp4"
 
     def test_gpt_oss_120b_weight_accuracy(self):
         """GPT OSS 120B mixed-precision should be ~63 GB, not ~60 GB"""
@@ -1593,7 +1594,8 @@ class TestMixedPrecisionQuantization:
         # Sum of component params
         component_params = sum(breakdown[f"{name}_params"] for name in
                                ("embed", "head", "attn", "state", "router",
-                                "ffn", "vision"))
+                                "dense_ffn", "shared_ffn", "expert_ffn",
+                                "vision"))
 
         # Should equal total params (allowing small rounding difference)
         total_params = result["params"]
@@ -1634,7 +1636,8 @@ class TestMixedPrecisionQuantization:
         assert breakdown["attn_bpp"] == 2.0, "Attention in modules_to_not_convert should be bf16"
 
         # Should quantize FFN/experts to int4
-        assert breakdown["ffn_bpp"] == 0.55, "FFN/experts should be quantized to int4"
+        assert breakdown["expert_ffn_bpp"] == 0.55, \
+            "Experts should be quantized to int4"
 
 
 def _dense_cfg(**overrides):
@@ -2017,6 +2020,179 @@ class TestVisionTowerSharding:
         two = estimate(cfg, "bf16", "bf16", 4096, 1, 2, "vllm", 32.0)
         assert two["weights"] * 2 > estimate(
             cfg, "bf16", "bf16", 4096, 1, 1, "vllm", 32.0)["weights"]
+
+
+class TestRealHybridConfigs:
+    """Real hybrid checkpoints, at pinned revisions.
+
+    The synthetic configs elsewhere in this file are written against what the
+    code expects. These are written against what upstream actually ships, which
+    is how the interesting gaps show up: Qwen3-Next states its layout with
+    `full_attention_interval` and no `layer_types` at all, and Nemotron-H names
+    its state geometry `ssm_state_size` / `conv_kernel` rather than with any
+    `mamba_`-prefixed key.
+    """
+
+    def test_qwen3_next_layout_comes_from_full_attention_interval(self):
+        cfg = fetch_config_or_skip("Qwen/Qwen3-Next-80B-A3B-Instruct")
+        d = parse_dims(cfg)
+        assert d.num_layers == 48
+        # Every fourth layer is full attention; the rest are gated delta net.
+        assert d.num_full_attn_layers == 12
+        assert d.num_recurrent_layers == 36
+        # use_sliding_window is false, so no layer may be charged a window.
+        assert d.num_sliding_attn_layers == 0
+        assert d.sliding_window == 0
+        assert 75e9 <= count_params(d) <= 85e9
+
+    def test_qwen3_next_state_page_is_about_a_megabyte_per_layer(self):
+        cfg = fetch_config_or_skip("Qwen/Qwen3-Next-80B-A3B-Instruct")
+        d = parse_dims(cfg)
+        per_layer = fit.state_page_bytes(d, 1) / d.num_recurrent_layers
+        # 32 heads x 128 keys x 128 values, plus a 3-column conv window over
+        # 8192 channels, in bf16.
+        expected = (32 * 128 * 128 + 8192 * (d.conv_kernel - 1)) * 2
+        assert per_layer == pytest.approx(expected, rel=1e-6)
+        # 32 state heads divide 2 and 4 evenly, so sharding is a clean halving.
+        assert fit.state_page_bytes(d, 2) * 2 == pytest.approx(
+            fit.state_page_bytes(d, 1), rel=1e-6)
+
+    def test_nemotron_h_reads_ssm_state_size_and_conv_kernel(self):
+        cfg = fetch_config_or_skip("nvidia/Nemotron-H-8B-Base-8K")
+        d = parse_dims(cfg)
+        assert d.num_layers == 52
+        # hybrid_override_pattern: mostly Mamba, four attention layers.
+        assert d.num_full_attn_layers == 4
+        assert d.num_recurrent_layers == 24
+        assert d.state_head_dim_k == 128     # ssm_state_size
+        assert d.conv_kernel == 4            # conv_kernel
+        assert d.num_state_heads == 128      # mamba_num_heads
+        assert d.state_head_dim_v == 64      # mamba_head_dim
+        assert "ssm_state_size" in d.state_source
+        assert fit.state_page_bytes(d, 1) > 0
+
+    def test_hybrid_kv_covers_only_attention_layers(self):
+        cfg = fetch_config_or_skip("nvidia/Nemotron-H-8B-Base-8K")
+        d = parse_dims(cfg)
+        charged = kv_bytes(d, 8192, 1, "bf16")
+        every_layer = (2 * d.num_kv_heads * d.head_dim * 2 * 8192 * d.num_layers)
+        # 4 of 52 layers hold a cache, so this is an order of magnitude apart.
+        assert charged == pytest.approx(every_layer * 4 / 52, rel=1e-6)
+
+    def test_hybrid_state_is_independent_of_context(self):
+        cfg = fetch_config_or_skip("Qwen/Qwen3-Next-80B-A3B-Instruct")
+        short = estimate(cfg, "bf16", "bf16", 4096, 4, 1, "vllm", 80.0)
+        long = estimate(cfg, "bf16", "bf16", 131072, 4, 1, "vllm", 80.0)
+        assert short["state"] == long["state"] > 0
+        assert long["kv"] > short["kv"]
+
+
+class TestRealSlidingWindowConfigs:
+    """Real sliding-window checkpoints, at pinned revisions."""
+
+    def test_mistral_v01_charges_every_layer_a_window(self):
+        cfg = fetch_config_or_skip("mistralai/Mistral-7B-Instruct-v0.1")
+        d = parse_dims(cfg)
+        assert d.sliding_window == 4096
+        assert d.num_sliding_attn_layers == d.num_layers == 32
+        assert d.num_full_attn_layers == 0
+
+    def test_mistral_v01_cache_stops_growing_past_the_window(self):
+        cfg = fetch_config_or_skip("mistralai/Mistral-7B-Instruct-v0.1")
+        d = parse_dims(cfg)
+        in_flight = fit.max_in_flight_tokens(32.0)
+        at_32k = kv_bytes(d, 32768, 4, "bf16", "vllm", in_flight)
+        at_64k = kv_bytes(d, 65536, 4, "bf16", "vllm", in_flight)
+        assert at_32k == at_64k
+        # window - 1 + two scheduler batches, not the full context.
+        assert at_32k == pytest.approx(
+            2 * d.num_kv_heads * d.head_dim * 2 * 32
+            * (4096 - 1 + in_flight) * 4, rel=1e-6)
+
+    def test_gpt_oss_interleaves_windowed_and_full_layers(self):
+        cfg = fetch_config_or_skip("openai/gpt-oss-20b")
+        d = parse_dims(cfg)
+        assert d.sliding_window == 128
+        assert d.num_sliding_attn_layers == 12
+        assert d.num_full_attn_layers == 12
+
+    def test_deepseek_v4_window_is_not_attributed_to_any_layer(self):
+        """Its sliding_window belongs to the sparse-attention indexer.
+
+        Charging those 43 layers a 128-token cache would under-estimate this
+        model roughly eightfold, and an under-estimate is what reports FITS for
+        a launch that dies at engine init.
+        """
+        cfg = fetch_config_or_skip("deepseek-ai/DeepSeek-V4-Flash")
+        d = parse_dims(cfg)
+        assert cfg.get("sliding_window") == 128
+        assert d.sliding_window == 0
+        assert d.num_sliding_attn_layers == 0
+        assert d.num_full_attn_layers == d.num_layers
+
+
+class TestRealQuantizedConfigs:
+    """Real quantized checkpoints, at pinned revisions."""
+
+    W4A16 = "RedHatAI/DeepSeek-R1-0528-quantized.w4a16"
+    FP8 = "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic"
+
+    def test_int4_detected_from_declared_bit_width(self):
+        cfg = fetch_config_or_skip(self.W4A16)
+        # quant_method is the container name ("compressed-tensors"), so the
+        # width has to come from config_groups[*].weights.num_bits.
+        assert cfg["quantization_config"]["quant_method"] == "compressed-tensors"
+        assert fit.detect_quant(cfg) == "int4"
+
+    def test_fp8_detected_from_declared_bit_width(self):
+        cfg = fetch_config_or_skip(self.FP8)
+        assert cfg["quantization_config"]["quant_method"] == "compressed-tensors"
+        assert fit.detect_quant(cfg) == "fp8"
+
+    def test_block_quantized_fp8_is_detected(self):
+        cfg = fetch_config_or_skip("deepseek-ai/DeepSeek-V4-Flash")
+        assert cfg["quantization_config"]["weight_block_size"] == [128, 128]
+        assert fit.detect_quant(cfg) == "fp8"
+
+    def test_regex_excludes_keep_attention_and_shared_experts_full_width(self):
+        cfg = fetch_config_or_skip(self.W4A16)
+        breakdown = estimate(cfg, "int4", "fp8", 4096, 1, 1,
+                             "vllm", 80.0)["mixed_breakdown"]
+        assert any(p.startswith("re:")
+                   for p in breakdown["excluded_patterns"])
+        # `re:.*self_attn.*` and `re:.*shared_experts.*`
+        assert breakdown["attn_bpp"] == 2.0
+        assert breakdown["shared_ffn_bpp"] == 2.0
+        # `re:.*mlp\.(gate|up|gate_up|down)_proj.*` names the dense replacement
+        # layers, which is deliberately not the routed experts.
+        assert breakdown["dense_ffn_bpp"] == 2.0
+        assert breakdown["expert_ffn_bpp"] == 0.55
+
+    def test_routed_experts_carry_the_weight_of_a_w4a16_moe(self):
+        """The experts are the reason this checkpoint fits on far fewer GPUs.
+
+        Charging the whole FFN at full width because one exclusion pattern
+        named the dense layers over-estimated this model by more than 3x.
+        """
+        cfg = fetch_config_or_skip(self.W4A16)
+        result = estimate(cfg, "int4", "fp8", 4096, 1, 1, "vllm", 80.0)
+        weights_gb = result["weights"] / GB
+        # The published checkpoint is about 380 GB of weight files.
+        assert 330 <= weights_gb <= 430, f"weights {weights_gb:.0f} GB"
+
+    def test_fp8_checkpoint_keeps_only_the_output_head_full_width(self):
+        cfg = fetch_config_or_skip(self.FP8)
+        breakdown = estimate(cfg, "fp8", "fp8", 4096, 1, 1,
+                             "vllm", 32.0)["mixed_breakdown"]
+        assert breakdown["excluded_patterns"] == ["lm_head"]
+        assert breakdown["head_bpp"] == 2.0
+        assert breakdown["embed_bpp"] == 2.0
+        assert breakdown["attn_bpp"] == 1.0
+        assert breakdown["dense_ffn_bpp"] == 1.0
+        weights_gb = estimate(cfg, "fp8", "fp8", 4096, 1, 1,
+                              "vllm", 32.0)["weights"] / GB
+        # 8 B params at fp8, plus a bf16 embedding table and output head.
+        assert 8.0 <= weights_gb <= 9.5
 
 
 class TestRecommenderParity:

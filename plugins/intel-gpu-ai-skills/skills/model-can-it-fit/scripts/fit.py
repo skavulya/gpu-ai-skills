@@ -778,6 +778,31 @@ def _recurrent_block_params(d: ModelDims) -> int:
     return in_proj + conv + out_proj + scalars + gate_norm
 
 
+def _ffn_param_split(d: ModelDims) -> tuple[int, int, int]:
+    """(dense-FFN, shared-expert, routed-expert) parameter counts.
+
+    Kept separate because quantization schemes routinely treat them
+    differently: a compressed-tensors export commonly quantizes the routed
+    experts -- where nearly all the weight is -- while leaving the dense
+    replacement layers and the shared expert at full width. Charging one rate
+    across all three is wrong by a factor, not a margin.
+    """
+    h = d.hidden
+    ffn_layers = d.num_ffn_layers or d.num_layers
+    if not d.is_moe:
+        return ffn_layers * 3 * h * d.intermediate, 0, 0
+
+    routed_per_layer = d.num_experts * 3 * h * d.intermediate
+    shared_per_layer = d.num_shared_experts * 3 * h * d.intermediate
+
+    dense_layers = 0
+    if d.first_k_dense_replace > 0 and d.dense_intermediate > 0:
+        dense_layers = min(d.first_k_dense_replace, ffn_layers)
+    moe_layers = ffn_layers - dense_layers
+    dense = dense_layers * 3 * h * d.dense_intermediate
+    return dense, moe_layers * shared_per_layer, moe_layers * routed_per_layer
+
+
 def count_params(d: ModelDims) -> int:
     h = d.hidden
     # Q projection dimension: for models with explicit head_dim ≠ hidden/num_heads,
@@ -801,24 +826,10 @@ def count_params(d: ModelDims) -> int:
     total = attn_layers * attn_block
     total += d.num_recurrent_layers * (_recurrent_block_params(d) + 2 * h)
 
-    if d.is_moe:
-        # Routed experts (standard MoE)
-        routed_ff = d.num_experts * 3 * h * d.intermediate
-        # Shared experts (DeepSeek-V4, some Mixtral variants)
-        shared_ff = d.num_shared_experts * 3 * h * d.intermediate
-        moe_ff_block = routed_ff + shared_ff
-
-        # Hybrid MoE: DeepSeek-V2/V3/V4 replace first K layers with dense FFN
-        if d.first_k_dense_replace > 0 and d.dense_intermediate > 0:
-            dense_layers = min(d.first_k_dense_replace, ffn_layers)
-            total += dense_layers * 3 * h * d.dense_intermediate
-            total += (ffn_layers - dense_layers) * moe_ff_block
-        else:
-            # Pure MoE: all layers use expert FFN
-            total += ffn_layers * moe_ff_block
-    else:
-        # Dense model
-        total += ffn_layers * 3 * h * d.intermediate
+    # Dense replacement layers (DeepSeek-V2/V3/V4's first_k_dense_replace),
+    # shared experts, and routed experts, each counted over the layers that
+    # actually carry them.
+    total += sum(_ffn_param_split(d))
     total += ffn_layers * 2 * h   # pre-FFN norm + residual norm
 
     emb = d.vocab * h
@@ -978,9 +989,23 @@ _COMPONENT_PROBES = {
         "model.layers.0.mlp.gate", "model.layers.0.mlp.router",
         "model.layers.0.block_sparse_moe.gate", "model.layers.0.mlp.gate.wg",
     ),
-    "ffn": (
+    # The three FFN kinds are probed separately: a checkpoint that quantizes
+    # its routed experts and exempts the dense and shared ones is the common
+    # case, not the exception, and nearly all the weight is in the experts.
+    "dense_ffn": (
         "model.layers.0.mlp.down_proj", "model.layers.0.mlp.gate_proj",
-        "model.layers.0.mlp.up_proj", "model.layers.0.mlp.experts.0.down_proj",
+        "model.layers.0.mlp.up_proj", "model.layers.0.feed_forward.w1",
+    ),
+    "shared_ffn": (
+        "model.layers.0.mlp.shared_experts.down_proj",
+        "model.layers.0.mlp.shared_expert.down_proj",
+        "model.layers.0.mlp.shared_mlp.down_proj",
+    ),
+    "expert_ffn": (
+        "model.layers.0.mlp.experts.0.down_proj",
+        "model.layers.0.mlp.experts.down_proj",
+        "model.layers.0.mlp.experts.gate_up_proj",
+        "model.layers.0.block_sparse_moe.experts.0.w1",
     ),
     "vision": (
         "visual.blocks.0.attn.qkv", "visual.blocks.0.mlp.down_proj",
@@ -1182,7 +1207,9 @@ def calculate_mixed_precision_weights(cfg: dict, d: ModelDims, params: int,
     keep_attn = _component_excluded(patterns, "attn")
     keep_state = _component_excluded(patterns, "state")
     keep_router = _component_excluded(patterns, "router")
-    keep_ffn = _component_excluded(patterns, "ffn")
+    keep_dense_ffn = _component_excluded(patterns, "dense_ffn")
+    keep_shared_ffn = _component_excluded(patterns, "shared_ffn")
+    keep_expert_ffn = _component_excluded(patterns, "expert_ffn")
     keep_vision = _component_excluded(patterns, "vision")
 
     h = d.hidden
@@ -1210,12 +1237,19 @@ def calculate_mixed_precision_weights(cfg: dict, d: ModelDims, params: int,
     # Router params (small, approximate as 2 * hidden per layer for MoE)
     router_params = d.num_layers * 2 * h if d.is_moe else 0
 
-    # FFN/Expert params = remaining
-    ffn_params = max(
-        params - embed_params - head_params - attn_params - state_params
-        - router_params - d.vision_params,
-        0,
-    )
+    dense_ffn_params, shared_ffn_params, expert_ffn_params = _ffn_param_split(d)
+
+    # Whatever the analytic counts above do not account for (norms, biases, a
+    # family this script models approximately) is charged with the largest FFN
+    # bucket so the components still sum to the total parameter count.
+    accounted = (embed_params + head_params + attn_params + state_params
+                 + router_params + d.vision_params + dense_ffn_params
+                 + shared_ffn_params + expert_ffn_params)
+    residual = params - accounted
+    if expert_ffn_params:
+        expert_ffn_params = max(expert_ffn_params + residual, 0)
+    else:
+        dense_ffn_params = max(dense_ffn_params + residual, 0)
 
     components = [
         ("embed", embed_params, keep_embeddings),
@@ -1223,7 +1257,9 @@ def calculate_mixed_precision_weights(cfg: dict, d: ModelDims, params: int,
         ("attn", attn_params, keep_attn),
         ("state", state_params, keep_state),
         ("router", router_params, keep_router),
-        ("ffn", ffn_params, keep_ffn),
+        ("dense_ffn", dense_ffn_params, keep_dense_ffn),
+        ("shared_ffn", shared_ffn_params, keep_shared_ffn),
+        ("expert_ffn", expert_ffn_params, keep_expert_ffn),
         ("vision", d.vision_params, keep_vision),
     ]
 
@@ -1621,7 +1657,9 @@ def main(argv: list[str] | None = None) -> int:
         print("Mixed-precision weight breakdown:")
         for key, label in (("embed", "Embeddings"), ("head", "Output head"),
                            ("attn", "Attention"), ("state", "SSM / conv"),
-                           ("router", "Routers"), ("ffn", "FFN/Experts"),
+                           ("router", "Routers"), ("dense_ffn", "Dense FFN"),
+                           ("shared_ffn", "Shared experts"),
+                           ("expert_ffn", "Routed experts"),
                            ("vision", "Vision tower")):
             # Below 5M params both columns round to 0.00 and the line is noise.
             if mixed_breakdown[f"{key}_params"] < 5_000_000:
