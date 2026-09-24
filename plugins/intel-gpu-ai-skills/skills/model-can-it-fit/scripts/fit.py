@@ -212,7 +212,6 @@ class ModelDims:
     state_head_dim_v: int = 0
     conv_dim: int = 0
     conv_kernel: int = 0
-    state_size: int = 0
     state_groups: int = 1
     state_inner: int = 0
     conv_dtype: str = "bfloat16"
@@ -290,8 +289,10 @@ _GLOBAL_SWA_FAMILIES = {
 }
 
 # Families whose sliding/global interleave lives in the modeling code rather
-# than in any config key, mapped to the period between global layers.
-_INTERLEAVED_SWA_PERIOD = {"gemma2": 2, "cohere2": 4}
+# than in any config key, mapped to the period between global layers. Cohere2
+# is not here: every real checkpoint ships `sliding_window_pattern`, which the
+# generic stride lookup below already reads.
+_INTERLEAVED_SWA_PERIOD = {"gemma2": 2}
 
 
 def _normalize_dtype(name: object, default: str = "bfloat16") -> str:
@@ -386,6 +387,20 @@ def _classify_layers(cfg: dict, text_cfg: dict, family: str,
     if isinstance(layer_types, (list, tuple)) and layer_types:
         counts = _scale_counts(_layer_type_counts(list(layer_types)),
                                len(layer_types), num_layers)
+        out.update(counts, layout_source=key)
+        if not counts["ffn"]:
+            out["ffn"] = num_layers
+        return out
+
+    no_rope, key = _lookup(sources, ("no_rope_layers",))
+    if isinstance(no_rope, (list, tuple)) and no_rope and window:
+        # Llama-4: 1 = layer keeps RoPE and the chunked/local window, 0 = the
+        # "NoPE" layer that runs full, unbounded attention instead.
+        sliding = sum(1 for v in no_rope if v)
+        counts = _scale_counts(
+            {"full": len(no_rope) - sliding, "sliding": sliding,
+             "recurrent": 0, "ffn": 0},
+            len(no_rope), num_layers)
         out.update(counts, layout_source=key)
         if not counts["ffn"]:
             out["ffn"] = num_layers
@@ -494,7 +509,6 @@ def _state_geometry(cfg: dict, text_cfg: dict, hidden: int) -> dict | None:
             "state_head_dim_v": int(dim_v),
             "conv_dim": int(2 * dim_k * num_k_heads + dim_v * num_v_heads),
             "conv_kernel": int(conv_kernel),
-            "state_size": int(dim_k),
             "state_groups": int(num_k_heads),
             "state_inner": int(dim_v * num_v_heads),
             "state_source": seen,
@@ -539,7 +553,6 @@ def _state_geometry(cfg: dict, text_cfg: dict, hidden: int) -> dict | None:
         "state_head_dim_v": int(head_dim),
         "conv_dim": int(inner) + 2 * int(groups) * int(d_state),
         "conv_kernel": int(conv_kernel),
-        "state_size": int(d_state),
         "state_groups": int(groups),
         "state_inner": int(inner),
         "state_source": seen,
@@ -748,7 +761,6 @@ def parse_dims(cfg: dict) -> ModelDims:
         state_head_dim_v=state.get("state_head_dim_v", 0),
         conv_dim=state.get("conv_dim", 0),
         conv_kernel=state.get("conv_kernel", 0),
-        state_size=state.get("state_size", 0),
         state_groups=state.get("state_groups", 1),
         state_inner=state.get("state_inner", 0),
         conv_dtype=model_dtype,
@@ -803,24 +815,38 @@ def _ffn_param_split(d: ModelDims) -> tuple[int, int, int]:
     return dense, moe_layers * shared_per_layer, moe_layers * routed_per_layer
 
 
-def count_params(d: ModelDims) -> int:
+def _attn_proj_params(d: ModelDims) -> int:
+    """Q/K/V/O projection parameter count for one attention layer.
+
+    For models with explicit head_dim != hidden/num_heads, Q projects to
+    num_attn_heads * head_dim (not hidden).
+    """
     h = d.hidden
-    # Q projection dimension: for models with explicit head_dim ≠ hidden/num_heads,
-    # Q projects to num_attn_heads * head_dim (not h)
     q_proj_dim = d.num_attn_heads * d.head_dim
     kv_proj_dim = d.num_kv_heads * d.head_dim
-    attn_block = (
+    return (
         h * q_proj_dim     # Q: hidden → num_attn_heads * head_dim
         + h * kv_proj_dim  # K: hidden → num_kv_heads * head_dim
         + h * kv_proj_dim  # V: hidden → num_kv_heads * head_dim
         + q_proj_dim * h   # O: num_attn_heads * head_dim → hidden
-        + 2 * h            # input + post-attention norms
     )
 
-    # Hybrids replace attention with an SSM on some layers, and families like
-    # Nemotron-H also have layers that carry neither. For a plain model all
-    # three counts collapse to num_layers.
-    attn_layers = d.num_full_attn_layers + d.num_sliding_attn_layers or d.num_layers
+
+def _attention_layers(d: ModelDims) -> int:
+    """Layer count to charge the attention-block formula over.
+
+    Hybrids replace attention with an SSM on some layers, and families like
+    Nemotron-H also have layers that carry neither. For a plain model all
+    three counts collapse to num_layers.
+    """
+    return d.num_full_attn_layers + d.num_sliding_attn_layers or d.num_layers
+
+
+def count_params(d: ModelDims) -> int:
+    h = d.hidden
+    attn_block = _attn_proj_params(d) + 2 * h  # input + post-attention norms
+
+    attn_layers = _attention_layers(d)
     ffn_layers = d.num_ffn_layers or d.num_layers
 
     total = attn_layers * attn_block
@@ -1220,16 +1246,8 @@ def calculate_mixed_precision_weights(cfg: dict, d: ModelDims, params: int,
 
     # Attention blocks, over attention layers only -- a hybrid's recurrent
     # layers have no Q/K/V/O projections to quantize.
-    q_proj_dim = d.num_attn_heads * d.head_dim
-    kv_proj_dim = d.num_kv_heads * d.head_dim
-    attn_per_layer = (
-        h * q_proj_dim +      # Q
-        h * kv_proj_dim +     # K
-        h * kv_proj_dim +     # V
-        q_proj_dim * h +      # O
-        4 * h                 # norms
-    )
-    attn_layers = d.num_full_attn_layers + d.num_sliding_attn_layers or d.num_layers
+    attn_per_layer = _attn_proj_params(d) + 4 * h  # norms
+    attn_layers = _attention_layers(d)
     attn_params = attn_layers * attn_per_layer
 
     state_params = d.num_recurrent_layers * _recurrent_block_params(d)
@@ -1267,16 +1285,18 @@ def calculate_mixed_precision_weights(cfg: dict, d: ModelDims, params: int,
     total_bytes = 0.0
     for name, count, keep in components:
         bpp = full_bpp if keep else quant_bpp
+        # Vision weights are replicated whole on every TP rank when
+        # vision_replicated; everything else is sharded across tp ranks.
         divisor = 1 if (name == "vision" and vision_replicated) else tp
-        component_bytes = count * bpp * tp / divisor
-        total_bytes += component_bytes
+        per_rank_bytes = count * bpp / divisor
+        total_bytes += per_rank_bytes
         breakdown[f"{name}_params"] = count
-        breakdown[f"{name}_bytes"] = int(count * bpp / divisor)
+        breakdown[f"{name}_bytes"] = int(per_rank_bytes)
         breakdown[f"{name}_bpp"] = bpp
     breakdown["vision_replicated"] = vision_replicated
     breakdown["excluded_patterns"] = patterns
 
-    return int(total_bytes / tp), breakdown
+    return int(total_bytes), breakdown
 
 
 def estimate(cfg: dict, quant: str, kv_dtype: str, ctx: int,

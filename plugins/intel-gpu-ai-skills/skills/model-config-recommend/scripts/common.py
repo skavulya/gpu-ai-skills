@@ -167,7 +167,9 @@ _GLOBAL_SWA_FAMILIES = {
     "phi3", "phi3small", "phimoe",
     "starcoder2",
 }
-_INTERLEAVED_SWA_PERIOD = {"gemma2": 2, "cohere2": 4}
+# Cohere2 is not here: every real checkpoint ships `sliding_window_pattern`,
+# which the generic stride lookup below already reads.
+_INTERLEAVED_SWA_PERIOD = {"gemma2": 2}
 
 
 def _normalize_dtype(name: object, default: str = "bfloat16") -> str:
@@ -243,6 +245,20 @@ def _classify_layers(cfg: dict, text_cfg: dict, family: str,
     if isinstance(layer_types, (list, tuple)) and layer_types:
         counts = _scale_counts(_layer_type_counts(list(layer_types)),
                                len(layer_types), num_layers)
+        out.update(counts, layout_source=key)
+        if not counts["ffn"]:
+            out["ffn"] = num_layers
+        return out
+
+    no_rope, key = _lookup(sources, ("no_rope_layers",))
+    if isinstance(no_rope, (list, tuple)) and no_rope and window:
+        # Llama-4: 1 = layer keeps RoPE and the chunked/local window, 0 = the
+        # "NoPE" layer that runs full, unbounded attention instead.
+        sliding = sum(1 for v in no_rope if v)
+        counts = _scale_counts(
+            {"full": len(no_rope) - sliding, "sliding": sliding,
+             "recurrent": 0, "ffn": 0},
+            len(no_rope), num_layers)
         out.update(counts, layout_source=key)
         if not counts["ffn"]:
             out["ffn"] = num_layers
@@ -408,7 +424,6 @@ class ModelDims:
     num_recurrent_layers: int = 0
     sliding_window: int = 0
     attn_on_recurrent_layers: bool = False
-    layout_source: str = ""
     # Recurrent (state-space) geometry, zero for attention-only models.
     num_state_heads: int = 0
     state_head_dim_k: int = 0
@@ -476,7 +491,6 @@ def parse_model_dims(cfg: dict) -> ModelDims:
         num_recurrent_layers=layers["recurrent"],
         sliding_window=window,
         attn_on_recurrent_layers=layers["attn_on_recurrent"],
-        layout_source=layers["layout_source"],
         num_state_heads=state.get("num_state_heads", 0),
         state_head_dim_k=state.get("state_head_dim_k", 0),
         state_head_dim_v=state.get("state_head_dim_v", 0),

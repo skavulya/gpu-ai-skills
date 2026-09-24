@@ -227,11 +227,12 @@ def evaluate_fit(d: ModelDims, params: int, quant: str, kv_dtype: str,
     bpp = HW["quants"][quant]["bytes_per_param"]
     weights = (params * bpp) / tp
     in_flight = max_in_flight_tokens(device_vram_gb)
+    state_per_request = state_page_bytes(d, tp, framework)
 
     def cache_for(ctx_: int, conc_: int) -> tuple[float, float]:
         kv_ = kv_bytes(d, ctx_, conc_, _kv_bytes(kv_dtype), framework,
                        in_flight) / tp
-        state_ = state_page_bytes(d, tp, framework) * conc_
+        state_ = state_per_request * conc_
         return kv_, state_
 
     kv, state = cache_for(ctx, concurrency)

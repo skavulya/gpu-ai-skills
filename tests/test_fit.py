@@ -42,6 +42,7 @@ with `python3 tests/data/fetch_configs.py` to make later runs offline-clean.
 import sys
 import os
 import json
+import functools
 import tempfile
 from pathlib import Path
 import pytest
@@ -113,8 +114,14 @@ def _write_cache(path, cfg):
         pass
 
 
+@functools.lru_cache(maxsize=None)
 def _load_config(model_id):
-    """Return a model's config.json, from cache if present, else from the Hub."""
+    """Return a model's config.json, from cache if present, else from the Hub.
+
+    Memoized per test session: several tests fetch the same real model, and
+    every caller treats the result as read-only, so one disk read (or Hub
+    fetch) per model per run is enough.
+    """
     revision = revision_for(model_id)
     path = cache_path(model_id, revision)
 
@@ -2116,6 +2123,16 @@ class TestRealSlidingWindowConfigs:
         assert d.num_sliding_attn_layers == 12
         assert d.num_full_attn_layers == 12
 
+    def test_llama4_scout_no_rope_layers_marks_the_global_layers(self):
+        cfg = fetch_config_or_skip("unsloth/Llama-4-Scout-17B-16E-Instruct")
+        d = parse_dims(cfg)
+        assert d.sliding_window == 8192  # attention_chunk_size
+        # Every fourth layer is `no_rope_layers: 0` -- a "NoPE" layer that
+        # runs full, unbounded attention. The rest are `1`: RoPE plus the
+        # chunked/local window.
+        assert d.num_full_attn_layers == 12
+        assert d.num_sliding_attn_layers == 36
+
     def test_deepseek_v4_window_is_not_attributed_to_any_layer(self):
         """Its sliding_window belongs to the sparse-attention indexer.
 
@@ -2222,6 +2239,10 @@ class TestRecommenderParity:
             hybrid_override_pattern="M-M-M-*-",
             mamba_d_state=128, mamba_d_conv=4, mamba_num_heads=128,
             mamba_head_dim=64, mamba_n_groups=8),
+        "llama4": _dense_cfg(
+            model_type="llama4_text", num_hidden_layers=8,
+            attention_chunk_size=2048,
+            no_rope_layers=[1, 1, 1, 0, 1, 1, 1, 0]),
     }
 
     @staticmethod

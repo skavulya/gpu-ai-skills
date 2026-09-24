@@ -67,6 +67,7 @@ drop one without checking what stops being covered.
     Mistral-7B-Instruct-v0.1         sliding window applied to every layer
     DeepSeek-R1-0528-quantized.w4a16 compressed-tensors int4 with `re:` excludes
     Llama-3.1-8B-Instruct-FP8-dynamic  compressed-tensors fp8 by declared bit width
+    Llama-4-Scout-17B-16E            sliding window keyed off `no_rope_layers`
 
 Expected results are recorded in the "Layer 3a" section of HOW_TO_TEST.md.
 """
@@ -93,6 +94,8 @@ MODEL_REVISIONS = {
                                           "0efe34e82e4612e726c42f6fd44116e0244b33f8",  # 2026-04-28
     "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic":
                                           "442e7f522277df12f53d63e8384087af31fbfc4b",  # 2026-07-10
+    "unsloth/Llama-4-Scout-17B-16E-Instruct":
+                                          "afd8e498c87bda51c7ea8ec68ea2f7c066e6340b",  # 2025-06-17
 
     # Gated: fetching config.json returns HTTP 401 without an accepted licence
     # and HF_TOKEN. Tests that need these skip when the fetch fails.
