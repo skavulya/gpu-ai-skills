@@ -30,6 +30,7 @@ from common import (
     is_local_model,
     kv_bytes,
     kv_bytes_per_token,
+    kv_shards,
     max_in_flight_tokens,
     parse_model_dims,
     state_page_bytes,
@@ -231,7 +232,7 @@ def evaluate_fit(d: ModelDims, params: int, quant: str, kv_dtype: str,
 
     def cache_for(ctx_: int, conc_: int) -> tuple[float, float]:
         kv_ = kv_bytes(d, ctx_, conc_, _kv_bytes(kv_dtype), framework,
-                       in_flight) / tp
+                       in_flight) / kv_shards(d, tp)
         state_ = state_per_request * conc_
         return kv_, state_
 
@@ -359,7 +360,7 @@ def rank_candidates(d: ModelDims, params: int, ctx: int, concurrency: int,
             qmeta = HW["quants"][quant]
             params_per_rank = params / tp
             weights_per_rank = params_per_rank * qmeta["bytes_per_param"]
-            kv_per_tok = kv_bytes_per_token(d, _kv_bytes(kv_dtype)) / tp
+            kv_per_tok = kv_bytes_per_token(d, _kv_bytes(kv_dtype)) / kv_shards(d, tp)
             roof_kwargs = {
                 "params": params_per_rank,
                 "weight_bytes": weights_per_rank,

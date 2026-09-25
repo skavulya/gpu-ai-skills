@@ -15,7 +15,8 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from common import count_params, fetch_config, kv_bytes_per_token, parse_model_dims
+from common import (count_params, fetch_config, kv_bytes_per_token, kv_shards,
+                    parse_model_dims)
 from roofline import factors_from_dict, peak_ops_s, phase_roofline
 
 
@@ -79,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     quant = HW["quants"][args.quant]
     factors = factors_from_dict(HW["framework_factors"][args.runtime])
     weight_bytes = params_per_rank * quant["bytes_per_param"]
-    kv_per_token = kv_bytes_per_token(dims, kv_dtype_bytes(args.kv_dtype)) / args.tensor_parallel
+    kv_per_token = kv_bytes_per_token(dims, kv_dtype_bytes(args.kv_dtype)) / kv_shards(dims, args.tensor_parallel)
     roof_kwargs = {
         "params": params_per_rank,
         "weight_bytes": weight_bytes,

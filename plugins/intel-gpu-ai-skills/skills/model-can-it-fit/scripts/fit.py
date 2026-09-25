@@ -219,6 +219,13 @@ class ModelDims:
     # Falcon-H1 and Zamba2 run attention and an SSM in the same layer, so
     # those layers are charged a full KV cache *and* a recurrent state.
     attn_on_recurrent_layers: bool = False
+    # Gated delta net and KDA split their heads with a plain divide, so vLLM
+    # refuses a TP degree that doesn't divide them. Mamba2 pads instead.
+    state_heads_divide_tp: bool = False
+    # MLA (DeepSeek-V2/V3, Kimi-K2, Ling-3.0) caches one compressed latent of
+    # kv_lora_rank + qk_rope_head_dim per token per layer instead of K and V,
+    # and every rank holds the whole latent. 0 for ordinary attention.
+    mla_kv_dim: int = 0
     # Which config keys the state geometry was actually read from, for the
     # refusal message and for tests.
     state_source: list[str] = field(default_factory=list)
@@ -369,6 +376,12 @@ def _sliding_window(cfg: dict, text_cfg: dict) -> int:
         return 0
 
 
+def _is_kda(sources: list[dict]) -> bool:
+    """Kimi-delta-attention hybrids (Ling-3.0 / BailingMoeV3) carry kda_* keys."""
+    return any(key.startswith("kda_") or "_kda_" in key
+               for src in sources for key in src)
+
+
 def _classify_layers(cfg: dict, text_cfg: dict, family: str,
                      num_layers: int, window: int) -> dict:
     """Split num_layers into full-attention / sliding / recurrent / FFN counts.
@@ -445,6 +458,17 @@ def _classify_layers(cfg: dict, text_cfg: dict, family: str,
         out.update(full=attn, recurrent=num_layers - attn, layout_source=key)
         return out
 
+    group, key = _lookup(sources, ("layer_group_size",))
+    if group and _is_kda(sources):
+        # BailingMoeV3: the last layer of each group, and every layer in the
+        # tail past the last whole group, is MLA; the rest are KDA.
+        group = int(group)
+        tail = num_layers // group * group
+        full = sum(1 for i in range(num_layers)
+                   if (i + 1) % group == 0 or i >= tail)
+        out.update(full=full, recurrent=num_layers - full, layout_source=key)
+        return out
+
     interval, key = _lookup(sources, ("full_attention_interval",))
     if interval:
         full = num_layers // int(interval)
@@ -512,6 +536,30 @@ def _state_geometry(cfg: dict, text_cfg: dict, hidden: int) -> dict | None:
             "state_groups": int(num_k_heads),
             "state_inner": int(dim_v * num_v_heads),
             "state_source": seen,
+            "divides_tp": True,
+        }
+
+    # Kimi delta attention (Ling-3.0): one head count and head_dim shared by
+    # q, k and v, a short conv over all three, and a (head_dim, head_dim)
+    # recurrent state per head.
+    if _is_kda(sources):
+        heads = take(("num_attention_heads",))
+        dim = take(("head_dim",))
+        conv_kernel = take(("short_conv_kernel_size",)) or 4
+        if not (heads and dim):
+            return None
+        return {
+            "num_state_heads": int(heads),
+            "state_head_dim_k": int(dim),
+            "state_head_dim_v": int(dim),
+            "conv_dim": 3 * int(heads) * int(dim),
+            "conv_kernel": int(conv_kernel),
+            "state_groups": int(heads),
+            "state_inner": int(heads) * int(dim),
+            "state_source": seen,
+            "divides_tp": True,
+            # vLLM keeps the KDA recurrent state in fp32 unless told otherwise.
+            "ssm_dtype": "float32",
         }
 
     # Mamba / Mamba2 (Nemotron-H, Bamba, Falcon-H1, Codestral-Mamba, Jamba).
@@ -708,6 +756,7 @@ def parse_dims(cfg: dict) -> ModelDims:
         searched = ", ".join((
             "linear_num_value_heads/linear_key_head_dim/linear_value_head_dim/"
             "linear_conv_kernel_dim (gated delta net)",
+            "kda_*/short_conv_kernel_size (Kimi delta attention)",
             "mamba_d_state/state_size/ssm_state_size/d_state",
             "mamba_d_conv/conv_kernel/d_conv",
             "mamba_d_ssm/mamba_expand/mamba_intermediate_size/d_inner",
@@ -732,8 +781,14 @@ def parse_dims(cfg: dict) -> ModelDims:
     ssm_dtype = _normalize_dtype(
         _lookup([text_cfg, cfg], ("mamba_ssm_cache_dtype", "ssm_cache_dtype",
                                   "mamba_ssm_dtype"))[0],
-        default=model_dtype,
+        default=state.get("ssm_dtype", model_dtype),
     )
+
+    kv_lora_rank = _lookup([text_cfg, cfg], ("kv_lora_rank",))[0]
+    mla_kv_dim = 0
+    if kv_lora_rank:
+        rope = _lookup([text_cfg, cfg], ("qk_rope_head_dim",))[0] or 64
+        mla_kv_dim = int(kv_lora_rank) + int(rope)
 
     return ModelDims(
         arch_family=family,
@@ -769,6 +824,8 @@ def parse_dims(cfg: dict) -> ModelDims:
         conv_dtype=model_dtype,
         ssm_dtype=ssm_dtype,
         attn_on_recurrent_layers=layout["attn_on_recurrent"],
+        state_heads_divide_tp=state.get("divides_tp", False),
+        mla_kv_dim=mla_kv_dim,
         state_source=state.get("state_source", []),
     )
 
@@ -920,7 +977,10 @@ def kv_bytes(d: ModelDims, ctx: int, concurrency: int, kv_dtype: str,
     bounded number of tokens no matter how long the context is, and a
     recurrent layer holds no KV cache at all.
     """
-    per_token_per_layer = 2 * d.num_kv_heads * d.head_dim * BYTES_PER_KV[kv_dtype]
+    if d.mla_kv_dim:
+        per_token_per_layer = d.mla_kv_dim * BYTES_PER_KV[kv_dtype]
+    else:
+        per_token_per_layer = 2 * d.num_kv_heads * d.head_dim * BYTES_PER_KV[kv_dtype]
 
     full_layers = d.num_full_attn_layers
     sliding_layers = d.num_sliding_attn_layers
@@ -932,6 +992,41 @@ def kv_bytes(d: ModelDims, ctx: int, concurrency: int, kv_dtype: str,
     if sliding_layers:
         tokens += sliding_layers * sliding_ctx(d, ctx, runtime, in_flight_tokens)
     return int(per_token_per_layer * tokens * concurrency)
+
+
+def kv_shards(d: ModelDims, tp: int) -> int:
+    """How many ways the KV cache actually splits across `tp` ranks.
+
+    Each rank holds max(1, kv_heads // tp) KV heads: with fewer KV heads than
+    ranks vLLM replicates them, so the split stops at kv_heads. MLA's latent
+    is not split at all.
+    """
+    if tp <= 1 or d.mla_kv_dim:
+        return 1
+    kv = max(int(d.num_kv_heads or 1), 1)
+    return max(1, kv // max(1, kv // tp))
+
+
+def tp_problems(d: ModelDims, tp: int) -> list[str]:
+    """Reasons vLLM would refuse to start this model at `tp`, or []."""
+    if tp <= 1:
+        return []
+    problems = []
+    if d.num_attn_heads % tp:
+        problems.append(f"{d.num_attn_heads} attention heads do not divide "
+                        f"evenly across TP={tp}")
+    kv = d.num_kv_heads
+    if not d.mla_kv_dim and kv and (kv % tp if kv >= tp else tp % kv):
+        problems.append(f"{kv} KV heads neither divide TP={tp} nor are "
+                        f"divisible by it")
+    if d.num_recurrent_layers and d.state_heads_divide_tp:
+        for count, what in ((d.num_state_heads, "linear-attention heads"),
+                            (d.state_groups, "linear-attention key heads")):
+            if count % tp:
+                problems.append(f"{count} {what} do not divide evenly "
+                                f"across TP={tp}")
+                break
+    return problems
 
 
 def state_page_bytes(d: ModelDims, tp: int, runtime: str = "vllm") -> int:
@@ -1311,10 +1406,11 @@ def estimate(cfg: dict, quant: str, kv_dtype: str, ctx: int,
     # Calculate weights with mixed-precision support
     weights, mixed_breakdown = calculate_mixed_precision_weights(cfg, d, params, quant, tp)
 
-    # KV cache is sharded by attention heads (divided by TP)
-    # Each GPU stores KV cache only for its subset of heads
+    # KV cache is sharded by KV heads, down to one head per rank; beyond
+    # that (and for MLA) each rank holds a full copy.
     in_flight = max_in_flight_tokens(device_vram_gb)
-    kv = kv_bytes(d, ctx, concurrency, kv_dtype, runtime, in_flight) // tp
+    shards = kv_shards(d, tp)
+    kv = kv_bytes(d, ctx, concurrency, kv_dtype, runtime, in_flight) // shards
 
     # Recurrent state is allocated per running request and does not shrink
     # with context, so it is charged alongside the KV cache rather than
@@ -1337,7 +1433,7 @@ def estimate(cfg: dict, quant: str, kv_dtype: str, ctx: int,
         max_concurrency = 0
         max_context = 0
     else:
-        per_request = kv_bytes(d, ctx, 1, kv_dtype, runtime, in_flight) // tp
+        per_request = kv_bytes(d, ctx, 1, kv_dtype, runtime, in_flight) // shards
         max_concurrency = free_for_kv // max(per_request + state_page, 1)
         max_context = _max_context(d, kv_dtype, max(concurrency, 1), tp,
                                    runtime, in_flight,
@@ -1363,6 +1459,7 @@ def estimate(cfg: dict, quant: str, kv_dtype: str, ctx: int,
         "max_concurrency": int(max_concurrency),
         "max_context": int(max_context),
         "mixed_breakdown": mixed_breakdown,
+        "tp_problems": tp_problems(d, tp),
     }
 
 
@@ -1376,12 +1473,13 @@ def _max_context(d: ModelDims, kv_dtype: str, concurrency: int, tp: int,
     """
     if budget <= 0:
         return 0
+    shards = kv_shards(d, tp)
     low, high = 0, 1 << 24
-    if kv_bytes(d, high, concurrency, kv_dtype, runtime, in_flight) // tp <= budget:
+    if kv_bytes(d, high, concurrency, kv_dtype, runtime, in_flight) // shards <= budget:
         return high
     while low < high - 1:
         mid = (low + high) // 2
-        if kv_bytes(d, mid, concurrency, kv_dtype, runtime, in_flight) // tp <= budget:
+        if kv_bytes(d, mid, concurrency, kv_dtype, runtime, in_flight) // shards <= budget:
             low = mid
         else:
             high = mid
@@ -1464,6 +1562,7 @@ def parse_tp_sweep(value: str | None) -> list[int]:
 def print_tp_sweep(cfg: dict, args: argparse.Namespace, tp_values: list[int]) -> None:
     rows = []
     first_fit = None
+    unlaunchable = {}
     for tp in tp_values:
         result = estimate(cfg, args.quant, args.kv_dtype, args.ctx,
                           args.concurrency, tp, args.runtime,
@@ -1481,7 +1580,10 @@ def print_tp_sweep(cfg: dict, args: argparse.Namespace, tp_values: list[int]) ->
             result["max_concurrency"],
             result["max_context"],
         ))
-        if result["fits"] and first_fit is None:
+        if result["tp_problems"]:
+            # Memory is moot when the engine refuses the split.
+            unlaunchable[tp] = result["tp_problems"]
+        elif result["fits"] and first_fit is None:
             first_fit = tp
 
     # The state column is dead weight for the overwhelmingly common case of a
@@ -1497,11 +1599,13 @@ def print_tp_sweep(cfg: dict, args: argparse.Namespace, tp_values: list[int]) ->
     print("  " + "-" * (93 if show_state else 83))
     for (tp, weights, kv, state, act, framework, total, headroom,
          fits, max_c, max_ctx) in rows:
-        verdict = "YES" if fits else "NO"
+        verdict = "n/a" if tp in unlaunchable else ("YES" if fits else "NO")
         state_cell = f"{fmt_gb(state)} " if show_state else ""
         print(f"  {tp:>2}  {fmt_gb(weights)} {fmt_gb(kv)} {state_cell}{fmt_gb(act)} "
               f"{fmt_gb(framework)} {fmt_gb(total)} {fmt_gb(headroom)} "
               f"{verdict:>3}  {max_c:>5}  {max_ctx:>7}")
+    for tp, problems in unlaunchable.items():
+        print(f"  n/a: vLLM will not start at TP={tp}: {'; '.join(problems)}")
     if first_fit is None:
         print("TP sweep verdict: no requested TP fits.")
     else:
@@ -1734,6 +1838,9 @@ def main(argv: list[str] | None = None) -> int:
               "23.91 GiB, measured) and the driver's allocatable ceiling sits "
               "~5% below physical. Re-run with the --gpu-memory-utilization "
               "the runtime will actually use before trusting a tight verdict.")
+
+    for problem in result["tp_problems"]:
+        print(f"Warning:           vLLM will not start at TP={args.tp}: {problem}")
 
     if fits:
         pct = 100 * headroom / usable_b

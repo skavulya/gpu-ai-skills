@@ -2226,6 +2226,156 @@ class TestRealQuantizedConfigs:
         assert 8.0 <= weights_gb <= 9.5
 
 
+LING_KDA = _dense_cfg(
+    architectures=["BailingMoeV3ForCausalLM"],
+    model_type="bailing_hybrid",
+    hidden_size=2048,
+    num_hidden_layers=24,
+    layer_group_size=4,
+    num_attention_heads=16,
+    num_key_value_heads=16,
+    head_dim=128,
+    kv_lora_rank=512,
+    q_lora_rank=256,
+    qk_rope_head_dim=64,
+    qk_nope_head_dim=128,
+    v_head_dim=128,
+    short_conv_kernel_size=4,
+    no_kda_lora=True,
+)
+
+
+class TestLingKdaMlaHybrid:
+    """Ling-3.0 (BailingMoeV3): KDA linear-attention layers plus MLA layers.
+
+    vLLM makes layer i MLA when (i + 1) % layer_group_size == 0 or when it
+    falls in the tail past the last whole group; every other layer is KDA.
+    """
+
+    def test_layer_group_size_splits_kda_and_mla(self):
+        d = parse_dims(LING_KDA)
+        assert d.num_full_attn_layers == 6
+        assert d.num_recurrent_layers == 18
+
+    def test_tail_layers_past_the_last_group_are_mla(self):
+        d = parse_dims(dict(LING_KDA, num_hidden_layers=26))
+        # 6 group-closing layers plus layers 24 and 25 in the tail.
+        assert d.num_full_attn_layers == 8
+        assert d.num_recurrent_layers == 18
+
+    def test_kda_state_geometry(self):
+        d = parse_dims(LING_KDA)
+        assert d.num_state_heads == 16
+        assert d.state_head_dim_k == d.state_head_dim_v == 128
+        # Short conv runs over q, k and v, each heads x head_dim wide.
+        assert d.conv_dim == 3 * 16 * 128
+        assert d.conv_kernel == 4
+
+    def test_kda_recurrent_state_is_fp32_by_default(self):
+        d = parse_dims(LING_KDA)
+        assert d.ssm_dtype == "float32"
+        assert d.conv_dtype == "bfloat16"
+
+    def test_kda_state_page_bytes(self):
+        d = parse_dims(LING_KDA)
+        conv = 3 * 16 * 128 * 3 * 2
+        ssm = 16 * 128 * 128 * 4
+        assert fit.state_page_bytes(d, 1) == (conv + ssm) * 18
+        assert fit.state_page_bytes(d, 4) == (conv + ssm) * 18 // 4
+
+    def test_mla_kv_is_the_compressed_latent(self):
+        d = parse_dims(LING_KDA)
+        # kv_lora_rank + qk_rope_head_dim, stored once (not K and V).
+        assert kv_bytes(d, 4096, 1, "bf16") == 576 * 2 * 6 * 4096
+
+    def test_mla_kv_is_not_divided_by_tp(self):
+        one = estimate(LING_KDA, "bf16", "bf16", 4096, 1, 1, "vllm", 32.0)
+        four = estimate(LING_KDA, "bf16", "bf16", 4096, 1, 4, "vllm", 32.0)
+        assert one["kv"] == four["kv"] > 0
+
+    def test_bailing_linear_without_kda_keys_keeps_its_layout(self):
+        """Ling-2.5 (bailing_moe_linear) uses layer_group_size too, but its
+        linear layers are not KDA; don't claim a KDA geometry for it."""
+        cfg = _dense_cfg(model_type="bailing_moe_linear", layer_group_size=4)
+        d = parse_dims(cfg)
+        assert d.num_recurrent_layers == 0
+
+
+class TestKvReplication:
+    """vLLM replicates KV heads when there are fewer of them than TP ranks."""
+
+    def test_kv_heads_below_tp_are_replicated(self):
+        cfg = _dense_cfg(num_key_value_heads=2)
+        two = estimate(cfg, "bf16", "bf16", 4096, 1, 2, "vllm", 80.0)
+        four = estimate(cfg, "bf16", "bf16", 4096, 1, 4, "vllm", 80.0)
+        # One KV head per rank at both TP2 and TP4.
+        assert two["kv"] == four["kv"]
+
+    def test_kv_heads_at_or_above_tp_still_shard(self):
+        cfg = _dense_cfg(num_key_value_heads=8)
+        one = estimate(cfg, "bf16", "bf16", 4096, 1, 1, "vllm", 80.0)
+        four = estimate(cfg, "bf16", "bf16", 4096, 1, 4, "vllm", 80.0)
+        assert four["kv"] == one["kv"] // 4
+
+    def test_max_context_uses_the_replicated_kv(self):
+        cfg = _dense_cfg(num_key_value_heads=2)
+        two = estimate(cfg, "bf16", "bf16", 4096, 1, 2, "vllm", 80.0)
+        four = estimate(cfg, "bf16", "bf16", 4096, 1, 4, "vllm", 80.0)
+        # KV per rank is unchanged, only weights shrink, so the ceiling grows
+        # by far less than 2x.
+        assert four["max_context"] < 1.5 * two["max_context"]
+
+
+class TestTpProblems:
+    """vLLM refuses to start when heads don't split evenly across ranks."""
+
+    def test_even_split_has_no_problems(self):
+        d = parse_dims(_dense_cfg())
+        assert fit.tp_problems(d, 1) == []
+        assert fit.tp_problems(d, 4) == []
+
+    def test_attention_heads_must_divide_tp(self):
+        d = parse_dims(_dense_cfg(num_attention_heads=32, num_key_value_heads=2))
+        problems = fit.tp_problems(d, 3)
+        assert any("attention heads" in p for p in problems)
+
+    def test_kv_heads_must_divide_or_be_divided_by_tp(self):
+        d = parse_dims(_dense_cfg(num_attention_heads=48, num_key_value_heads=8))
+        assert any("KV heads" in p for p in fit.tp_problems(d, 6))
+        # 2 KV heads, TP 4: replicated evenly, fine.
+        d = parse_dims(_dense_cfg(num_key_value_heads=2))
+        assert fit.tp_problems(d, 4) == []
+
+    def test_gated_delta_net_heads_must_divide_tp(self):
+        d = parse_dims(_dense_cfg(
+            num_attention_heads=24, num_key_value_heads=4,
+            **TestHybridStateSpace.GDN))
+        assert any("linear" in p for p in fit.tp_problems(d, 3))
+
+    def test_mamba2_pads_instead_of_refusing(self):
+        d = parse_dims(_dense_cfg(**TestHybridStateSpace.MAMBA2))
+        assert fit.tp_problems(d, 2) == []
+
+    def test_mla_skips_the_kv_head_rule(self):
+        d = parse_dims(LING_KDA)
+        assert fit.tp_problems(d, 4) == []
+        assert any("attention heads" in p for p in fit.tp_problems(d, 3))
+
+    def test_estimate_reports_problems(self):
+        cfg = _dense_cfg(num_attention_heads=32, num_key_value_heads=2)
+        assert estimate(cfg, "bf16", "bf16", 4096, 1, 3, "vllm", 80.0)["tp_problems"]
+        assert estimate(cfg, "bf16", "bf16", 4096, 1, 2, "vllm", 80.0)["tp_problems"] == []
+
+    def test_sweep_skips_unlaunchable_tp(self, tmp_path, capsys):
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps(LING_KDA))
+        fit.main(["--model", str(path), "--quant", "bf16", "--kv-dtype", "bf16",
+                  "--tp", "3", "--tp-sweep", "3,4", "--device-vram-gb", "80"])
+        out = capsys.readouterr().out
+        assert "Warning:           vLLM will not start at TP=3" in out
+        assert "smallest requested TP that fits = 4" in out
+
+
 class TestRecommenderParity:
     """model-config-recommend must charge the same cache as model-can-it-fit.
 
@@ -2259,6 +2409,7 @@ class TestRecommenderParity:
             hybrid_override_pattern="M-M-M-*-",
             mamba_d_state=128, mamba_d_conv=4, mamba_num_heads=128,
             mamba_head_dim=64, mamba_n_groups=8),
+        "kda_mla": LING_KDA,
         "llama4": _dense_cfg(
             model_type="llama4_text", num_hidden_layers=8,
             attention_chunk_size=2048,

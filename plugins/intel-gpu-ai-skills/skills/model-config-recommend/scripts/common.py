@@ -234,6 +234,12 @@ def _sliding_window(cfg: dict, text_cfg: dict) -> int:
         return 0
 
 
+def _is_kda(sources: list[dict]) -> bool:
+    """Kimi-delta-attention hybrids (Ling-3.0 / BailingMoeV3) carry kda_* keys."""
+    return any(key.startswith("kda_") or "_kda_" in key
+               for src in sources for key in src)
+
+
 def _classify_layers(cfg: dict, text_cfg: dict, family: str,
                      num_layers: int, window: int) -> dict:
     """Split num_layers into full-attention / sliding / recurrent / FFN counts."""
@@ -302,6 +308,17 @@ def _classify_layers(cfg: dict, text_cfg: dict, family: str,
         out.update(full=attn, recurrent=num_layers - attn, layout_source=key)
         return out
 
+    group, key = _lookup(sources, ("layer_group_size",))
+    if group and _is_kda(sources):
+        # BailingMoeV3: the last layer of each group, and every layer in the
+        # tail past the last whole group, is MLA; the rest are KDA.
+        group = int(group)
+        tail = num_layers // group * group
+        full = sum(1 for i in range(num_layers)
+                   if (i + 1) % group == 0 or i >= tail)
+        out.update(full=full, recurrent=num_layers - full, layout_source=key)
+        return out
+
     interval, key = _lookup(sources, ("full_attention_interval",))
     if interval:
         full = num_layers // int(interval)
@@ -362,6 +379,26 @@ def _state_geometry(cfg: dict, text_cfg: dict, hidden: int) -> dict | None:
             "conv_kernel": int(conv_kernel),
             "state_groups": int(num_k_heads),
             "state_source": seen,
+        }
+
+    # Kimi delta attention (Ling-3.0): q, k and v share one head count and
+    # head_dim, with a short conv over all three.
+    if _is_kda(sources):
+        heads = take(("num_attention_heads",))
+        dim = take(("head_dim",))
+        conv_kernel = take(("short_conv_kernel_size",)) or 4
+        if not (heads and dim):
+            return None
+        return {
+            "num_state_heads": int(heads),
+            "state_head_dim_k": int(dim),
+            "state_head_dim_v": int(dim),
+            "conv_dim": 3 * int(heads) * int(dim),
+            "conv_kernel": int(conv_kernel),
+            "state_groups": int(heads),
+            "state_source": seen,
+            # vLLM keeps the KDA recurrent state in fp32 unless told otherwise.
+            "ssm_dtype": "float32",
         }
 
     # Mamba / Mamba2 (Nemotron-H, Bamba, Falcon-H1, Jamba, Codestral-Mamba).
@@ -434,6 +471,9 @@ class ModelDims:
     conv_dtype: str = "bfloat16"
     ssm_dtype: str = "bfloat16"
     state_source: list[str] = field(default_factory=list)
+    # MLA caches one kv_lora_rank + qk_rope_head_dim latent per token per
+    # layer, whole on every rank. 0 for ordinary attention.
+    mla_kv_dim: int = 0
 
 
 def parse_model_dims(cfg: dict) -> ModelDims:
@@ -487,8 +527,13 @@ def parse_model_dims(cfg: dict) -> ModelDims:
     ssm_dtype = _normalize_dtype(
         _lookup([text_cfg, cfg], ("mamba_ssm_cache_dtype", "ssm_cache_dtype",
                                   "mamba_ssm_dtype"))[0],
-        default=dtype,
+        default=state.get("ssm_dtype", dtype),
     )
+    kv_lora_rank = _lookup([text_cfg, cfg], ("kv_lora_rank",))[0]
+    mla_kv_dim = 0
+    if kv_lora_rank:
+        rope = _lookup([text_cfg, cfg], ("qk_rope_head_dim",))[0] or 64
+        mla_kv_dim = int(kv_lora_rank) + int(rope)
     return ModelDims(
         family, hidden, num_layers, int(num_attn),
         int(num_kv), int(head_dim), int(intermediate),
@@ -507,6 +552,7 @@ def parse_model_dims(cfg: dict) -> ModelDims:
         conv_dtype=dtype,
         ssm_dtype=ssm_dtype,
         state_source=state.get("state_source", []),
+        mla_kv_dim=mla_kv_dim,
     )
 
 
@@ -548,7 +594,25 @@ def kv_bytes_per_token(dims: ModelDims, kv_dtype_bytes: float) -> int:
     """
     full, sliding = _attention_layers(dims)
     layers = full + sliding
-    return int(2 * layers * dims.num_kv_heads * dims.head_dim * kv_dtype_bytes)
+    return int(layers * _kv_elements_per_token_per_layer(dims) * kv_dtype_bytes)
+
+
+def _kv_elements_per_token_per_layer(dims: ModelDims) -> int:
+    if dims.mla_kv_dim:
+        return dims.mla_kv_dim
+    return 2 * dims.num_kv_heads * dims.head_dim
+
+
+def kv_shards(dims: ModelDims, tp: int) -> int:
+    """How many ways the KV cache actually splits across `tp` ranks.
+
+    Each rank holds max(1, kv_heads // tp) KV heads, so with fewer KV heads
+    than ranks vLLM replicates them. MLA's latent is not split at all.
+    """
+    if tp <= 1 or dims.mla_kv_dim:
+        return 1
+    kv = max(int(dims.num_kv_heads or 1), 1)
+    return max(1, kv // max(1, kv // tp))
 
 
 def default_max_num_batched_tokens(device_vram_gb: float) -> int:
@@ -592,7 +656,7 @@ def kv_bytes(dims: ModelDims, ctx: int, concurrency: int,
     Charged per layer: a sliding-window layer holds a bounded number of tokens
     however long the context is, and a recurrent layer holds no KV cache.
     """
-    per_token_per_layer = 2 * dims.num_kv_heads * dims.head_dim * kv_dtype_bytes
+    per_token_per_layer = _kv_elements_per_token_per_layer(dims) * kv_dtype_bytes
     full, sliding = _attention_layers(dims)
     tokens = full * ctx
     if sliding:
