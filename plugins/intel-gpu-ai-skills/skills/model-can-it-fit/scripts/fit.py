@@ -727,8 +727,11 @@ def parse_dims(cfg: dict) -> ModelDims:
 
     model_dtype = _normalize_dtype(cfg.get("torch_dtype")
                                    or text_cfg.get("torch_dtype"))
+    # Qwen3.5 declares its state dtype as mamba_ssm_dtype, which vLLM adopts
+    # when --mamba-ssm-cache-dtype is left at auto.
     ssm_dtype = _normalize_dtype(
-        _lookup([text_cfg, cfg], ("mamba_ssm_cache_dtype", "ssm_cache_dtype"))[0],
+        _lookup([text_cfg, cfg], ("mamba_ssm_cache_dtype", "ssm_cache_dtype",
+                                  "mamba_ssm_dtype"))[0],
         default=model_dtype,
     )
 

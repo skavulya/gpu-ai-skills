@@ -1828,6 +1828,20 @@ class TestHybridStateSpace:
         assert (fit.state_page_bytes(d, 1, "sglang")
                 > fit.state_page_bytes(d, 1, "vllm"))
 
+    def test_ssm_state_dtype_is_read_from_mamba_ssm_dtype(self):
+        """Qwen3.5 configs declare their recurrent state dtype as mamba_ssm_dtype.
+
+        vLLM resolves --mamba-ssm-cache-dtype=auto to that field, so a float32
+        declaration doubles the ssm state even though the weights are bf16.
+        """
+        bf16 = parse_dims(_dense_cfg(**self.GDN))
+        fp32 = parse_dims(_dense_cfg(**self.GDN, mamba_ssm_dtype="float32"))
+        assert fp32.ssm_dtype == "float32"
+        ssm = lambda d: d.num_state_heads * d.state_head_dim_k * d.state_head_dim_v
+        extra = ssm(fp32) * 2 * fp32.num_recurrent_layers
+        assert (fit.state_page_bytes(fp32, 1)
+                == fit.state_page_bytes(bf16, 1) + extra)
+
     def test_state_shards_across_tp(self):
         d = parse_dims(_dense_cfg(**self.GDN))
         assert fit.state_page_bytes(d, 2) < fit.state_page_bytes(d, 1)
@@ -2233,6 +2247,12 @@ class TestRecommenderParity:
             linear_conv_kernel_dim=4, linear_key_head_dim=128,
             linear_num_key_heads=16, linear_num_value_heads=32,
             linear_value_head_dim=128,
+            layer_types=["linear_attention"] * 6 + ["full_attention"] * 2),
+        "hybrid_fp32_state": _dense_cfg(
+            model_type="qwen3_5_text", num_hidden_layers=8,
+            linear_conv_kernel_dim=4, linear_key_head_dim=128,
+            linear_num_key_heads=16, linear_num_value_heads=48,
+            linear_value_head_dim=128, mamba_ssm_dtype="float32",
             layer_types=["linear_attention"] * 6 + ["full_attention"] * 2),
         "mamba2": _dense_cfg(
             model_type="nemotron_h", num_hidden_layers=8,
